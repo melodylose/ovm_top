@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, Focus, LogFilter},
+    app::{App, FcView, Focus, LogFilter},
     log,
 };
 
@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
 };
 
 fn format_bytes_per_sec(value: u64) -> String {
@@ -79,6 +79,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(7),
+            Constraint::Min(8),
             Constraint::Min(5),
             Constraint::Length(3),
         ]
@@ -87,6 +88,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(9),
             Constraint::Length(8),
             Constraint::Length(8),
+            Constraint::Length(7),
             Constraint::Min(8),
             Constraint::Length(3),
         ]
@@ -286,6 +288,184 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .borders(Borders::ALL),
     );
 
+    let detail_layout =
+        app.fc_panel_mode == crate::app::FcPanelMode::Detail && chunks[4].width >= 90;
+    let fc_areas = if detail_layout {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+            .split(chunks[4])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100)])
+            .split(chunks[4])
+    };
+    let fc_summary_area = fc_areas[0];
+    let fc_detail_area = if detail_layout {
+        fc_areas[1]
+    } else {
+        chunks[4]
+    };
+    let fc_viewport = table_viewport(if detail_layout {
+        fc_summary_area
+    } else {
+        chunks[4]
+    });
+    let fc = app.fc.lock().unwrap();
+    let selected_fc = if app.fc_panel_mode == crate::app::FcPanelMode::Detail {
+        app.fc_detail_map.unwrap_or(0)
+    } else {
+        app.fc_selected.unwrap_or(0)
+    };
+    let compact_fc_rows = fc
+        .maps
+        .iter()
+        .enumerate()
+        .map(|(index, map)| {
+            let row = Row::new(vec![
+                Cell::from(map.wwid.clone()),
+                Cell::from(map.mapper.clone()),
+                Cell::from(map.size.clone()),
+                Cell::from(format!("{}/{}", map.active_paths, map.total_paths)),
+                Cell::from(map.status.clone()),
+            ]);
+            if index == selected_fc {
+                row.style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                row
+            }
+        })
+        .collect::<Vec<_>>();
+    let (fc_title, fc_total, fc_header, fc_rows) = match app.fc_config.view {
+        FcView::Ports => (
+            "Ports",
+            fc.hosts.len(),
+            vec!["HOST", "PORT WWN", "STATE", "SPEED", "FABRIC"],
+            fc.hosts
+                .iter()
+                .map(|host| {
+                    Row::new(vec![
+                        Cell::from(host.name.clone()),
+                        Cell::from(host.port_wwn.clone().unwrap_or_else(|| "-".into())),
+                        Cell::from(host.port_state.clone().unwrap_or_else(|| "-".into())),
+                        Cell::from(host.speed.clone().unwrap_or_else(|| "-".into())),
+                        Cell::from(host.fabric_name.clone().unwrap_or_else(|| "-".into())),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        ),
+        FcView::Targets => (
+            "Targets",
+            fc.targets.len(),
+            vec!["TARGET", "HOST", "PORT WWN", "NODE WWN", "PORT ID"],
+            fc.targets
+                .iter()
+                .map(|target| {
+                    Row::new(vec![
+                        Cell::from(target.name.clone()),
+                        Cell::from(format!("host{}", target.host)),
+                        Cell::from(target.port_wwn.clone().unwrap_or_else(|| "-".into())),
+                        Cell::from(target.node_wwn.clone().unwrap_or_else(|| "-".into())),
+                        Cell::from(target.port_id.clone().unwrap_or_else(|| "-".into())),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        ),
+        FcView::Multipath => (
+            "Multipath",
+            fc.maps.len(),
+            vec![
+                "WWID", "MAP", "SIZE", "PATHS", "STATUS", "READ", "WRITE", "RIOPS", "WIOPS", "UTIL",
+            ],
+            fc.maps
+                .iter()
+                .enumerate()
+                .map(|(index, map)| {
+                    let (read, write, riops, wiops, util) = map.io.as_ref().map_or_else(
+                        || {
+                            (
+                                "N/A".to_string(),
+                                "N/A".to_string(),
+                                "N/A".to_string(),
+                                "N/A".to_string(),
+                                "N/A".to_string(),
+                            )
+                        },
+                        |io| {
+                            (
+                                format_bytes_per_sec(io.read_bytes_per_sec),
+                                format_bytes_per_sec(io.write_bytes_per_sec),
+                                io.read_iops.to_string(),
+                                io.write_iops.to_string(),
+                                format_percent(io.utilization_percent),
+                            )
+                        },
+                    );
+                    let row = Row::new(vec![
+                        Cell::from(map.wwid.clone()),
+                        Cell::from(map.mapper.clone()),
+                        Cell::from(map.size.clone()),
+                        Cell::from(format!("{}/{}", map.active_paths, map.total_paths)),
+                        Cell::from(map.status.clone()),
+                        Cell::from(read),
+                        Cell::from(write),
+                        Cell::from(riops),
+                        Cell::from(wiops),
+                        Cell::from(util),
+                    ]);
+                    if index == selected_fc {
+                        row.style(
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        row
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ),
+    };
+    drop(fc);
+    if app.fc_panel_mode == crate::app::FcPanelMode::Detail {
+        app.fc_scroll.total = fc_total;
+        app.fc_scroll.viewport = fc_viewport;
+        app.fc_scroll.offset = app
+            .fc_scroll
+            .offset
+            .min(fc_total.saturating_sub(fc_viewport));
+    } else {
+        app.set_scroll_metrics(Focus::Fc, fc_total, fc_viewport);
+    }
+    let fc_scroll = app.fc_scroll.offset;
+    let fc_table = Table::new(
+        fc_rows.into_iter().skip(fc_scroll),
+        fc_header
+            .iter()
+            .map(|_| Constraint::Min(10))
+            .collect::<Vec<_>>(),
+    )
+    .header(Row::new(
+        fc_header.into_iter().map(Cell::from).collect::<Vec<_>>(),
+    ))
+    .block(
+        Block::default()
+            .title(panel_title(
+                5,
+                &format!("FC/SAN - {fc_title}"),
+                app.focus == Focus::Fc,
+            ))
+            .border_style(panel_border_style(app.focus == Focus::Fc))
+            .title_style(panel_border_style(app.focus == Focus::Fc))
+            .borders(Borders::ALL),
+    );
     let log_table = if app.show_logs {
         let filter_label = match app.log_filter {
             LogFilter::All => "ALL",
@@ -297,7 +477,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .iter()
             .filter(|entry| app.log_filter.matches(entry.level))
             .count();
-        let log_viewport = table_viewport(chunks[4]);
+        let log_viewport = table_viewport(chunks[5]);
         app.set_scroll_metrics(Focus::Logs, log_total, log_viewport);
         let log_scroll = app.log_scroll.offset;
         let mut entries: Vec<_> = app
@@ -354,22 +534,220 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Focus::Domains => "Domains",
         Focus::Network => "Network",
         Focus::Disk => "Disk",
+        Focus::Fc => "FC/SAN",
         Focus::Logs => "Logs",
     };
-    let footer = Paragraph::new(format!(
-        "focus: {focus_label}  1/2/3: panels  4/l: logs  j/k: scroll  f: filter  c: clear  s: save  q: quit"
-    ))
+    let shortcuts =
+        if app.focus == Focus::Fc && app.fc_panel_mode == crate::app::FcPanelMode::Detail {
+            "h: hide detail  u/d: preview map  j/k: scroll tree  Esc: back"
+        } else if app.focus == Focus::Fc {
+            "h: hide detail  j/k: select  l: show detail  4: logs  o: FC config"
+        } else {
+            "1/2/3/5: panels  4: logs  j/k: scroll  q: quit"
+        };
+    let footer = Paragraph::new(format!("focus: {focus_label}  {shortcuts}"))
         .block(Block::default().borders(Borders::ALL));
 
     frame.render_widget(host, chunks[0]);
     frame.render_widget(table, chunks[1]);
     frame.render_widget(network_table, chunks[2]);
     frame.render_widget(disk_table, chunks[3]);
-    if let Some(log_table) = log_table {
-        frame.render_widget(log_table, chunks[4]);
-        frame.render_widget(footer, chunks[5]);
+    if app.fc_panel_mode == crate::app::FcPanelMode::Detail {
+        frame.render_widget(Clear, fc_summary_area);
+        frame.render_widget(Clear, fc_detail_area);
+        let summary_table = Table::new(
+            compact_fc_rows.into_iter().skip(app.fc_scroll.offset),
+            [
+                Constraint::Min(18),
+                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Length(7),
+                Constraint::Length(10),
+            ],
+        )
+        .header(Row::new(vec![
+            Cell::from("WWID"),
+            Cell::from("MAP"),
+            Cell::from("SIZE"),
+            Cell::from("PATHS"),
+            Cell::from("STATUS"),
+        ]))
+        .block(
+            Block::default()
+                .title(panel_title(5, "FC/SAN Summary", app.focus == Focus::Fc))
+                .border_style(panel_border_style(app.focus == Focus::Fc))
+                .title_style(panel_border_style(app.focus == Focus::Fc))
+                .borders(Borders::ALL),
+        );
+        if detail_layout {
+            frame.render_widget(summary_table, fc_summary_area);
+        }
+        let mut rendered_detail = false;
+        if let Some(map_index) = app.fc_detail_map {
+            let detail_map = app
+                .fc
+                .lock()
+                .ok()
+                .and_then(|snapshot| snapshot.maps.get(map_index).cloned());
+            if let Some(map) = detail_map {
+                let detail_viewport = table_viewport(fc_detail_area);
+                let mut tree_rows = vec![
+                    Row::new(vec![Cell::from("└─ Multipath Map"), Cell::from("")]),
+                    Row::new(vec![Cell::from("   ├─ WWID"), Cell::from(map.wwid.clone())]),
+                    Row::new(vec![
+                        Cell::from("   ├─ Mapper"),
+                        Cell::from(map.mapper.clone()),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("   ├─ Vendor"),
+                        Cell::from(map.vendor.clone()),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("   ├─ Model"),
+                        Cell::from(map.model.clone()),
+                    ]),
+                    Row::new(vec![Cell::from("   ├─ Size"), Cell::from(map.size.clone())]),
+                    Row::new(vec![
+                        Cell::from("   ├─ Status"),
+                        Cell::from(map.status.clone()),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("   ├─ Paths"),
+                        Cell::from(format!("{}/{}", map.active_paths, map.total_paths)),
+                    ]),
+                ];
+                let io_values = map.io.as_ref().map_or_else(
+                    || {
+                        vec![
+                            ("Read", "N/A".to_string()),
+                            ("Write", "N/A".to_string()),
+                            ("Read IOPS", "N/A".to_string()),
+                            ("Write IOPS", "N/A".to_string()),
+                            ("Utilization", "N/A".to_string()),
+                        ]
+                    },
+                    |io| {
+                        vec![
+                            ("Read", format_bytes_per_sec(io.read_bytes_per_sec)),
+                            ("Write", format_bytes_per_sec(io.write_bytes_per_sec)),
+                            ("Read IOPS", io.read_iops.to_string()),
+                            ("Write IOPS", io.write_iops.to_string()),
+                            ("Utilization", format_percent(io.utilization_percent)),
+                        ]
+                    },
+                );
+                tree_rows.push(Row::new(vec![Cell::from("   ├─ Disk I/O"), Cell::from("")]));
+                for (index, (label, value)) in io_values.into_iter().enumerate() {
+                    let branch = if index == 4 {
+                        "   │  └─ "
+                    } else {
+                        "   │  ├─ "
+                    };
+                    tree_rows.push(Row::new(vec![
+                        Cell::from(format!("{branch}{label}")),
+                        Cell::from(value),
+                    ]));
+                }
+                tree_rows.push(Row::new(vec![Cell::from("   └─ Paths"), Cell::from("")]));
+                for (index, path) in map.paths.iter().enumerate() {
+                    let path_branch = if index + 1 == map.paths.len() {
+                        "      └─ "
+                    } else {
+                        "      ├─ "
+                    };
+                    tree_rows.push(Row::new(vec![
+                        Cell::from(format!("{path_branch}{}", path.hctl)),
+                        Cell::from(path.state.clone()),
+                    ]));
+                    let detail_branch = if index + 1 == map.paths.len() {
+                        "         "
+                    } else {
+                        "      │  "
+                    };
+                    tree_rows.push(Row::new(vec![
+                        Cell::from(format!("{detail_branch}├─ Device")),
+                        Cell::from(path.device.clone()),
+                    ]));
+                    tree_rows.push(Row::new(vec![
+                        Cell::from(format!("{detail_branch}└─ Major:Minor")),
+                        Cell::from(path.major_minor.clone()),
+                    ]));
+                }
+                app.set_scroll_metrics(Focus::Fc, tree_rows.len(), detail_viewport);
+                let detail_scroll = app.fc_detail_scroll.offset;
+                let detail_table = Table::new(
+                    tree_rows.into_iter().skip(detail_scroll),
+                    [Constraint::Length(32), Constraint::Min(24)],
+                )
+                .header(Row::new(vec![
+                    Cell::from("FC/SAN TREE"),
+                    Cell::from("VALUE"),
+                ]))
+                .block(
+                    Block::default()
+                        .title(panel_title(5, "FC/SAN Detail", app.focus == Focus::Fc))
+                        .border_style(panel_border_style(app.focus == Focus::Fc))
+                        .title_style(panel_border_style(app.focus == Focus::Fc))
+                        .borders(Borders::ALL),
+                );
+                frame.render_widget(detail_table, fc_detail_area);
+                rendered_detail = true;
+            }
+        }
+        if !rendered_detail {
+            frame.render_widget(
+                Paragraph::new("No FC/SAN detail available").block(
+                    Block::default()
+                        .title("[5] FC/SAN Detail")
+                        .borders(Borders::ALL),
+                ),
+                fc_detail_area,
+            );
+        }
     } else {
-        frame.render_widget(footer, chunks[4]);
+        frame.render_widget(fc_table, chunks[4]);
+    }
+    if let Some(log_table) = log_table {
+        frame.render_widget(log_table, chunks[5]);
+        frame.render_widget(footer, chunks[6]);
+    } else {
+        frame.render_widget(footer, chunks[5]);
+    }
+
+    if app.fc_config_open {
+        let area = frame.area();
+        let menu_area = Rect::new(
+            area.x.saturating_add(area.width.saturating_sub(36) / 2),
+            area.y.saturating_add(area.height.saturating_sub(10) / 2),
+            36.min(area.width),
+            10.min(area.height),
+        );
+        let options = [
+            "Ports",
+            "Targets",
+            "Multipath",
+            if app.fc_config.show_path_detail {
+                "Path detail: Visible"
+            } else {
+                "Path detail: Hidden"
+            },
+        ];
+        let mut text = String::from("FC/SAN Configuration\n\n");
+        for (index, option) in options.iter().enumerate() {
+            text.push_str(if index == app.fc_config_index {
+                "> "
+            } else {
+                "  "
+            });
+            text.push_str(option);
+            text.push('\n');
+        }
+        text.push_str("\nEnter: apply  Esc: cancel");
+        frame.render_widget(Clear, menu_area);
+        frame.render_widget(
+            Paragraph::new(text).block(Block::default().title(" Config ").borders(Borders::ALL)),
+            menu_area,
+        );
     }
 }
 

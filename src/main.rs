@@ -18,7 +18,7 @@ use crossterm::{
 };
 
 use crate::{
-    app::{App, Focus, LogFilter, ScrollResult, ScrollState},
+    app::{App, FcPanelMode, Focus, LogFilter, ScrollResult, ScrollState},
     collector::{disk, net, xentop, xm},
     log::{LogEvent, LogLevel, LogSource},
 };
@@ -29,6 +29,7 @@ fn main() -> Result<()> {
     let domains = Arc::new(Mutex::new(Vec::<xentop::DomainView>::new()));
     let network = Arc::new(Mutex::new(Vec::new()));
     let disk_rates = Arc::new(Mutex::new(Vec::new()));
+    let fc = Arc::new(Mutex::new(collector::fc::FcSnapshot::default()));
     let (log_tx, log_rx) = mpsc::channel();
 
     let mut app = App {
@@ -41,10 +42,19 @@ fn main() -> Result<()> {
         domains: Arc::clone(&domains),
         network: Arc::clone(&network),
         disk: Arc::clone(&disk_rates),
+        fc: Arc::clone(&fc),
         focus: Focus::Domains,
         domain_scroll: ScrollState::default(),
         network_scroll: ScrollState::default(),
         disk_scroll: ScrollState::default(),
+        fc_scroll: ScrollState::default(),
+        fc_selected: None,
+        fc_detail_scroll: ScrollState::default(),
+        fc_panel_mode: FcPanelMode::Summary,
+        fc_detail_map: None,
+        fc_config: Default::default(),
+        fc_config_open: false,
+        fc_config_index: 2,
         logs: Default::default(),
         log_scroll: ScrollState::default(),
         log_filter: LogFilter::default(),
@@ -66,6 +76,7 @@ fn main() -> Result<()> {
 
     net::spawn_network_collector(Arc::clone(&network), log_tx.clone());
     disk::spawn_disk_collector(Arc::clone(&disk_rates), log_tx.clone());
+    collector::fc::spawn_fc_collector(Arc::clone(&fc), log_tx.clone());
 
     enable_raw_mode()?;
 
@@ -99,16 +110,31 @@ fn run(
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
+                if app.fc_config_open {
+                    match key.code {
+                        KeyCode::Esc => app.fc_config_open = false,
+                        KeyCode::Up => app.move_fc_config(false),
+                        KeyCode::Down => app.move_fc_config(true),
+                        KeyCode::Enter => app.apply_fc_config(),
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') => break,
+                    KeyCode::Esc if app.fc_panel_mode == FcPanelMode::Detail => {
+                        app.close_fc_detail();
+                        let _ = log_tx.send(LogEvent::info(LogSource::Ui, "FC/SAN detail closed"));
+                    }
+                    KeyCode::Esc => break,
                     KeyCode::Char('1') => set_focus(app, Focus::Domains, log_tx),
                     KeyCode::Char('2') => set_focus(app, Focus::Network, log_tx),
                     KeyCode::Char('3') => set_focus(app, Focus::Disk, log_tx),
-                    KeyCode::Char('4') => {
-                        app.focus_logs();
+                    KeyCode::Char('5') => {
+                        app.focus_fc();
                         log_focus_change(app, log_tx);
                     }
-                    KeyCode::Char('l') => {
+                    KeyCode::Char('4') => {
                         if app.show_logs {
                             app.hide_logs();
                             let _ = log_tx.send(LogEvent::info(LogSource::Ui, "logs hidden"));
@@ -117,13 +143,61 @@ fn run(
                             log_focus_change(app, log_tx);
                         }
                     }
+                    KeyCode::Char('h')
+                        if app.focus == Focus::Fc && app.fc_panel_mode == FcPanelMode::Detail =>
+                    {
+                        app.close_fc_detail();
+                        let _ = log_tx.send(LogEvent::info(LogSource::Ui, "FC/SAN detail hidden"));
+                    }
                     KeyCode::Char('j') => {
-                        let result = app.scroll_down();
-                        log_scroll_result(app, result, log_tx);
+                        if app.focus == Focus::Fc
+                            && app.fc_panel_mode == FcPanelMode::Summary
+                            && app.fc_config.view == crate::app::FcView::Multipath
+                        {
+                            app.select_fc_down();
+                        } else {
+                            let result = app.scroll_down();
+                            log_scroll_result(app, result, log_tx);
+                        }
                     }
                     KeyCode::Char('k') => {
-                        let result = app.scroll_up();
-                        log_scroll_result(app, result, log_tx);
+                        if app.focus == Focus::Fc
+                            && app.fc_panel_mode == FcPanelMode::Summary
+                            && app.fc_config.view == crate::app::FcView::Multipath
+                        {
+                            app.select_fc_up();
+                        } else {
+                            let result = app.scroll_up();
+                            log_scroll_result(app, result, log_tx);
+                        }
+                    }
+                    KeyCode::Char('l')
+                        if app.focus == Focus::Fc && app.fc_panel_mode == FcPanelMode::Summary =>
+                    {
+                        if app.open_fc_detail() {
+                            let _ =
+                                log_tx.send(LogEvent::info(LogSource::Ui, "FC/SAN detail opened"));
+                        }
+                    }
+                    KeyCode::Char('u')
+                        if app.focus == Focus::Fc && app.fc_panel_mode == FcPanelMode::Detail =>
+                    {
+                        if !app.preview_fc_map(-1) {
+                            let _ = log_tx.send(LogEvent::info(
+                                LogSource::Ui,
+                                "FC/SAN detail reached first map",
+                            ));
+                        }
+                    }
+                    KeyCode::Char('d')
+                        if app.focus == Focus::Fc && app.fc_panel_mode == FcPanelMode::Detail =>
+                    {
+                        if !app.preview_fc_map(1) {
+                            let _ = log_tx.send(LogEvent::info(
+                                LogSource::Ui,
+                                "FC/SAN detail reached last map",
+                            ));
+                        }
                     }
                     KeyCode::Char('f') if app.focus == Focus::Logs => app.cycle_log_filter(),
                     KeyCode::Char('c') if app.focus == Focus::Logs => app.logs.clear(),
@@ -132,6 +206,7 @@ fn run(
                             save_logs(app, log_tx);
                         }
                     }
+                    KeyCode::Char('o') if app.focus == Focus::Fc => app.open_fc_config(),
                     _ => {}
                 }
             }
@@ -146,6 +221,7 @@ fn focus_name(focus: Focus) -> &'static str {
         Focus::Domains => "Domains",
         Focus::Network => "Network",
         Focus::Disk => "Disk",
+        Focus::Fc => "FC/SAN",
         Focus::Logs => "Logs",
     }
 }

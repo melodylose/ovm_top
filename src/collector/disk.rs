@@ -77,36 +77,41 @@ pub fn calculate_rates(
     current: &[DiskStats],
     elapsed: Duration,
 ) -> Vec<DiskRate> {
-    let elapsed_seconds = elapsed.as_secs_f64().max(f64::EPSILON);
-    let elapsed_ms = elapsed.as_millis().max(1) as f64;
+    current
+        .iter()
+        .filter(|stat| is_display_device(&stat.name))
+        .filter_map(|curr| calculate_rate(previous, curr, elapsed))
+        .collect()
+}
+
+pub fn calculate_rate(
+    previous: &[DiskStats],
+    current: &DiskStats,
+    elapsed: Duration,
+) -> Option<DiskRate> {
     let previous_map: HashMap<&str, &DiskStats> = previous
         .iter()
         .map(|stat| (stat.name.as_str(), stat))
         .collect();
+    let prev = previous_map.get(current.name.as_str())?;
+    let elapsed_seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    let elapsed_ms = elapsed.as_millis().max(1) as f64;
+    let read_sectors = current.sectors_read.saturating_sub(prev.sectors_read);
+    let write_sectors = current.sectors_written.saturating_sub(prev.sectors_written);
+    let reads = current.reads_completed.saturating_sub(prev.reads_completed);
+    let writes = current
+        .writes_completed
+        .saturating_sub(prev.writes_completed);
+    let io_ms = current.io_time_ms.saturating_sub(prev.io_time_ms);
 
-    current
-        .iter()
-        .filter(|stat| is_display_device(&stat.name))
-        .filter_map(|curr| {
-            let prev = previous_map.get(curr.name.as_str())?;
-            let read_sectors = curr.sectors_read.saturating_sub(prev.sectors_read);
-            let write_sectors = curr.sectors_written.saturating_sub(prev.sectors_written);
-            let reads = curr.reads_completed.saturating_sub(prev.reads_completed);
-            let writes = curr.writes_completed.saturating_sub(prev.writes_completed);
-            let io_ms = curr.io_time_ms.saturating_sub(prev.io_time_ms);
-
-            Some(DiskRate {
-                name: curr.name.clone(),
-                read_bytes_per_sec: (read_sectors as f64 * SECTOR_SIZE as f64 / elapsed_seconds)
-                    as u64,
-                write_bytes_per_sec: (write_sectors as f64 * SECTOR_SIZE as f64 / elapsed_seconds)
-                    as u64,
-                read_iops: (reads as f64 / elapsed_seconds) as u64,
-                write_iops: (writes as f64 / elapsed_seconds) as u64,
-                utilization_percent: ((io_ms as f64 / elapsed_ms) * 100.0).min(100.0),
-            })
-        })
-        .collect()
+    Some(DiskRate {
+        name: current.name.clone(),
+        read_bytes_per_sec: (read_sectors as f64 * SECTOR_SIZE as f64 / elapsed_seconds) as u64,
+        write_bytes_per_sec: (write_sectors as f64 * SECTOR_SIZE as f64 / elapsed_seconds) as u64,
+        read_iops: (reads as f64 / elapsed_seconds) as u64,
+        write_iops: (writes as f64 / elapsed_seconds) as u64,
+        utilization_percent: ((io_ms as f64 / elapsed_ms) * 100.0).min(100.0),
+    })
 }
 
 pub fn read_diskstats() -> Result<Vec<DiskStats>> {

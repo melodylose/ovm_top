@@ -2,7 +2,6 @@ use crate::collector::xm::XmDomain;
 use crate::log::{LogEvent, LogSource};
 use anyhow::{Context, Result};
 use std::{
-    collections::HashMap,
     io::{BufRead, BufReader},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -54,6 +53,7 @@ pub fn spawn_domain_view_collector(
     log_tx: std::sync::mpsc::Sender<LogEvent>,
 ) {
     thread::spawn(move || {
+        let mut last_merge_diagnostic = None;
         loop {
             let inventory = match crate::collector::xm::get_domains() {
                 Ok(v) => v,
@@ -79,7 +79,33 @@ pub fn spawn_domain_view_collector(
                 }
             };
 
-            let merged = merge_domains(&inventory, &realtime_snapshot);
+            let (merged, fallback_matches, unmatched_realtime, unmatched_inventory) =
+                merge_domains_with_diagnostics(&inventory, &realtime_snapshot);
+            let diagnostic = (fallback_matches, unmatched_realtime, unmatched_inventory);
+            if last_merge_diagnostic != Some(diagnostic) {
+                let event =
+                    if fallback_matches > 0 || unmatched_realtime > 0 || unmatched_inventory > 0 {
+                        LogEvent::warn(
+                            LogSource::Domain,
+                            format!(
+                                "domain merge used {fallback_matches} order fallbacks; \
+                             {unmatched_inventory} inventory rows and \
+                             {unmatched_realtime} realtime rows unmatched"
+                            ),
+                        )
+                    } else {
+                        LogEvent::info(
+                            LogSource::Domain,
+                            format!(
+                                "domain merge healthy: inventory={} realtime={}",
+                                inventory.len(),
+                                realtime_snapshot.len()
+                            ),
+                        )
+                    };
+                let _ = log_tx.send(event);
+                last_merge_diagnostic = Some(diagnostic);
+            }
 
             if let Ok(mut shared) = output.lock() {
                 *shared = merged;
@@ -91,10 +117,40 @@ pub fn spawn_domain_view_collector(
 }
 
 pub fn merge_domains(inventory: &[XmDomain], realtime: &[DomainStats]) -> Vec<DomainView> {
-    inventory
+    merge_domains_with_diagnostics(inventory, realtime).0
+}
+
+pub fn merge_domains_with_diagnostics(
+    inventory: &[XmDomain],
+    realtime: &[DomainStats],
+) -> (Vec<DomainView>, usize, usize, usize) {
+    let mut used = vec![false; realtime.len()];
+    let mut fallback_matches = 0;
+    let mut matched_inventory = 0;
+    let domains = inventory
         .iter()
-        .map(|xm| {
-            let rt = realtime.iter().find(|x| x.name == xm.name);
+        .enumerate()
+        .map(|(index, xm)| {
+            // Some xentop versions truncate NAME to a fixed-width column. In
+            // that case several domains can have the same parsed name (or no
+            // name match at all), so retain the stream order as a fallback.
+            let named_match = realtime
+                .iter()
+                .enumerate()
+                .find(|(position, x)| !used[*position] && x.name == xm.name)
+                .map(|(position, _)| position);
+            let matched_index = named_match.or_else(|| {
+                let fallback = (index < realtime.len() && !used[index]).then_some(index);
+                if fallback.is_some() {
+                    fallback_matches += 1;
+                }
+                fallback
+            });
+            if let Some(position) = matched_index {
+                used[position] = true;
+                matched_inventory += 1;
+            }
+            let rt = matched_index.and_then(|position| realtime.get(position));
 
             DomainView {
                 name: xm.name.clone(),
@@ -117,7 +173,15 @@ pub fn merge_domains(inventory: &[XmDomain], realtime: &[DomainStats]) -> Vec<Do
                 vbd_wr: rt.map(|x| x.vbd_wr).unwrap_or_default(),
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let unmatched_realtime = used.iter().filter(|used| !**used).count();
+    let unmatched_inventory = inventory.len().saturating_sub(matched_inventory);
+    (
+        domains,
+        fallback_matches,
+        unmatched_realtime,
+        unmatched_inventory,
+    )
 }
 
 pub fn spawn_collector(
@@ -125,7 +189,7 @@ pub fn spawn_collector(
     log_tx: std::sync::mpsc::Sender<LogEvent>,
 ) -> Result<()> {
     let mut child = Command::new("xentop")
-        .args(["-b", "-d", "1"])
+        .args(["-b", "-f", "-d", "1"])
         .stdout(Stdio::piped())
         .spawn()
         .context("failed to start xentop")?;
@@ -137,7 +201,8 @@ pub fn spawn_collector(
 
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        let mut latest = HashMap::<String, DomainStats>::new();
+        let mut snapshot = Vec::new();
+        let mut duplicate_warning_sent = false;
 
         for line in reader.lines() {
             let Ok(line) = line else {
@@ -148,17 +213,30 @@ pub fn spawn_collector(
                 break;
             };
 
-            if let Some(stats) = parse_line(&line) {
-                latest.insert(stats.name.clone(), stats);
-
-                let mut new_domains: Vec<_> = latest.values().cloned().collect();
-
-                new_domains.sort_by(|a, b| a.name.cmp(&b.name));
-
-                if let Ok(mut shared) = domains.lock() {
-                    *shared = new_domains;
+            if is_header(&line) {
+                if !snapshot.is_empty() {
+                    publish_snapshot(
+                        &domains,
+                        &mut snapshot,
+                        &log_tx,
+                        &mut duplicate_warning_sent,
+                    );
                 }
+                continue;
             }
+
+            if let Some(stats) = parse_line(&line) {
+                snapshot.push(stats);
+            }
+        }
+
+        if !snapshot.is_empty() {
+            publish_snapshot(
+                &domains,
+                &mut snapshot,
+                &log_tx,
+                &mut duplicate_warning_sent,
+            );
         }
     });
 
@@ -167,7 +245,17 @@ pub fn spawn_collector(
 
 pub fn get_domains_once() -> Result<Vec<DomainStats>> {
     let output = Command::new("sudo")
-        .args(["env", "TERM=xterm", "xentop", "-b", "-d", "1", "-i", "2"])
+        .args([
+            "env",
+            "TERM=xterm",
+            "xentop",
+            "-b",
+            "-f",
+            "-d",
+            "1",
+            "-i",
+            "2",
+        ])
         .output()
         .context("failed to execute xentop")?;
 
@@ -177,19 +265,53 @@ pub fn get_domains_once() -> Result<Vec<DomainStats>> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let mut latest = HashMap::<String, DomainStats>::new();
+    let mut latest = Vec::new();
+    let mut snapshot = Vec::new();
 
     for line in stdout.lines() {
+        if is_header(line) {
+            if !snapshot.is_empty() {
+                latest = std::mem::take(&mut snapshot);
+            }
+            continue;
+        }
         if let Some(stats) = parse_line(line) {
-            latest.insert(stats.name.clone(), stats);
+            snapshot.push(stats);
         }
     }
+    if !snapshot.is_empty() {
+        latest = snapshot;
+    }
 
-    let mut domains: Vec<_> = latest.into_values().collect();
+    Ok(latest)
+}
 
-    domains.sort_by(|a, b| a.name.cmp(&b.name));
+fn is_header(line: &str) -> bool {
+    line.split_whitespace().next() == Some("NAME")
+}
 
-    Ok(domains)
+fn publish_snapshot(
+    output: &Arc<Mutex<Vec<DomainStats>>>,
+    snapshot: &mut Vec<DomainStats>,
+    log_tx: &std::sync::mpsc::Sender<LogEvent>,
+    duplicate_warning_sent: &mut bool,
+) {
+    let duplicate_names = snapshot
+        .iter()
+        .map(|domain| domain.name.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        < snapshot.len();
+    if duplicate_names && !*duplicate_warning_sent {
+        let _ = log_tx.send(LogEvent::warn(
+            LogSource::Domain,
+            "xentop returned duplicate domain names; preserving stream order",
+        ));
+        *duplicate_warning_sent = true;
+    }
+    if let Ok(mut shared) = output.lock() {
+        *shared = std::mem::take(snapshot);
+    }
 }
 
 pub fn parse_line(line: &str) -> Option<DomainStats> {
@@ -224,4 +346,49 @@ pub fn parse_line(line: &str) -> Option<DomainStats> {
         vbd_wsect: cols[17].parse().ok()?,
         ssid: cols[18].parse().ok()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn realtime(name: &str, cpu_percent: f64) -> DomainStats {
+        DomainStats {
+            name: name.to_string(),
+            cpu_percent,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preserves_duplicate_xentop_names_for_merge_order_fallback() {
+        let inventory = vec![
+            XmDomain {
+                name: "domain-a".into(),
+                id: 1,
+                ..Default::default()
+            },
+            XmDomain {
+                name: "domain-b".into(),
+                id: 2,
+                ..Default::default()
+            },
+        ];
+        let realtime = vec![realtime("0004fb0000", 12.5), realtime("0004fb0000", 34.5)];
+
+        let merged = merge_domains(&inventory, &realtime);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].cpu_percent, 12.5);
+        assert_eq!(merged[1].cpu_percent, 34.5);
+    }
+
+    #[test]
+    fn parses_xentop_sample_without_collapsing_rows() {
+        let first = "domain-a -----r 10 12.5 100 1.0 100 1.0 2 1 3 4 1 0 5 6 7 8 0";
+        let second = "domain-a --b--- 20 34.5 200 2.0 200 2.0 4 2 6 8 2 0 9 10 11 12 0";
+
+        assert!(parse_line(first).is_some());
+        assert!(parse_line(second).is_some());
+    }
 }
