@@ -1,4 +1,5 @@
 use crate::collector::xm::XmDomain;
+use crate::log::{LogEvent, LogSource};
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
@@ -50,12 +51,17 @@ pub struct DomainView {
 pub fn spawn_domain_view_collector(
     realtime: Arc<Mutex<Vec<DomainStats>>>,
     output: Arc<Mutex<Vec<DomainView>>>,
+    log_tx: std::sync::mpsc::Sender<LogEvent>,
 ) {
     thread::spawn(move || {
         loop {
             let inventory = match crate::collector::xm::get_domains() {
                 Ok(v) => v,
                 Err(_) => {
+                    let _ = log_tx.send(LogEvent::warn(
+                        LogSource::Domain,
+                        "failed to refresh domain inventory with xm list",
+                    ));
                     thread::sleep(Duration::from_secs(2));
                     continue;
                 }
@@ -64,6 +70,10 @@ pub fn spawn_domain_view_collector(
             let realtime_snapshot = match realtime.lock() {
                 Ok(v) => v.clone(),
                 Err(_) => {
+                    let _ = log_tx.send(LogEvent::warn(
+                        LogSource::Domain,
+                        "failed to read xentop domain snapshot",
+                    ));
                     thread::sleep(Duration::from_secs(2));
                     continue;
                 }
@@ -110,7 +120,10 @@ pub fn merge_domains(inventory: &[XmDomain], realtime: &[DomainStats]) -> Vec<Do
         .collect()
 }
 
-pub fn spawn_collector(domains: Arc<Mutex<Vec<DomainStats>>>) -> Result<()> {
+pub fn spawn_collector(
+    domains: Arc<Mutex<Vec<DomainStats>>>,
+    log_tx: std::sync::mpsc::Sender<LogEvent>,
+) -> Result<()> {
     let mut child = Command::new("xentop")
         .args(["-b", "-d", "1"])
         .stdout(Stdio::piped())
@@ -128,6 +141,10 @@ pub fn spawn_collector(domains: Arc<Mutex<Vec<DomainStats>>>) -> Result<()> {
 
         for line in reader.lines() {
             let Ok(line) = line else {
+                let _ = log_tx.send(LogEvent::warn(
+                    LogSource::Domain,
+                    "xentop output stream ended",
+                ));
                 break;
             };
 

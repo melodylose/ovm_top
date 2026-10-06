@@ -1,8 +1,9 @@
+use crate::log::{LogEvent, LogSource};
 use anyhow::Result;
 use std::{
     collections::HashMap,
     fs,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc::Sender},
     thread,
     time::Duration,
 };
@@ -31,11 +32,17 @@ pub struct NetRate {
     pub tx_drops_per_sec: u64,
 }
 
-pub fn spawn_network_collector(network: Arc<Mutex<Vec<NetRate>>>) {
+pub fn spawn_network_collector(network: Arc<Mutex<Vec<NetRate>>>, log_tx: Sender<LogEvent>) {
     thread::spawn(move || {
         let mut previous = match read_net_dev() {
             Ok(stats) => stats,
-            Err(_) => return,
+            Err(error) => {
+                let _ = log_tx.send(LogEvent::error(
+                    LogSource::Network,
+                    format!("failed to read /proc/net/dev: {error}"),
+                ));
+                return;
+            }
         };
 
         loop {
@@ -43,7 +50,13 @@ pub fn spawn_network_collector(network: Arc<Mutex<Vec<NetRate>>>) {
 
             let current = match read_net_dev() {
                 Ok(stats) => stats,
-                Err(_) => continue,
+                Err(error) => {
+                    let _ = log_tx.send(LogEvent::warn(
+                        LogSource::Network,
+                        format!("failed to refresh /proc/net/dev: {error}"),
+                    ));
+                    continue;
+                }
             };
 
             let rates = calculate_rates(&previous, &current);
