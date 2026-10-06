@@ -1,3 +1,4 @@
+use crate::collector::xm::XmDomain;
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
@@ -5,6 +6,7 @@ use std::{
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -28,6 +30,84 @@ pub struct DomainStats {
     pub vbd_rsect: u64,
     pub vbd_wsect: u64,
     pub ssid: u32,
+}
+
+#[derive(Debug)]
+pub struct DomainView {
+    pub name: String,
+    pub id: u32,
+    pub state: String,
+    pub memory_mb: u64,
+    pub vcpus: u32,
+    pub cpu_percent: f64,
+    pub memory_percent: f64,
+    pub net_tx_kb: f64,
+    pub net_rx_kb: f64,
+    pub vbd_rd: u64,
+    pub vbd_wr: u64,
+}
+
+pub fn spawn_domain_view_collector(
+    realtime: Arc<Mutex<Vec<DomainStats>>>,
+    output: Arc<Mutex<Vec<DomainView>>>,
+) {
+    thread::spawn(move || {
+        loop {
+            let inventory = match crate::collector::xm::get_domains() {
+                Ok(v) => v,
+                Err(_) => {
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            let realtime_snapshot = match realtime.lock() {
+                Ok(v) => v.clone(),
+                Err(_) => {
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            let merged = merge_domains(&inventory, &realtime_snapshot);
+
+            if let Ok(mut shared) = output.lock() {
+                *shared = merged;
+            }
+
+            thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
+pub fn merge_domains(inventory: &[XmDomain], realtime: &[DomainStats]) -> Vec<DomainView> {
+    inventory
+        .iter()
+        .map(|xm| {
+            let rt = realtime.iter().find(|x| x.name == xm.name);
+
+            DomainView {
+                name: xm.name.clone(),
+                id: xm.id,
+                state: xm.state.clone(),
+
+                memory_mb: xm.memory_mb,
+                vcpus: xm.vcpus,
+
+                cpu_percent: rt.map(|x| x.cpu_percent).unwrap_or_default(),
+
+                memory_percent: rt.map(|x| x.memory_percent).unwrap_or_default(),
+
+                net_tx_kb: rt.map(|x| x.net_tx_kb).unwrap_or_default(),
+
+                net_rx_kb: rt.map(|x| x.net_rx_kb).unwrap_or_default(),
+
+                vbd_rd: rt.map(|x| x.vbd_rd).unwrap_or_default(),
+
+                vbd_wr: rt.map(|x| x.vbd_wr).unwrap_or_default(),
+            }
+        })
+        .collect()
 }
 
 pub fn spawn_collector(domains: Arc<Mutex<Vec<DomainStats>>>) -> Result<()> {

@@ -72,9 +72,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Paragraph::new(host_text).block(Block::default().title(" Xen Host ").borders(Borders::ALL));
 
     let header = Row::new(vec![
+        Cell::from("ID"),
         Cell::from("NAME"),
         Cell::from("STATE"),
         Cell::from("CPU%"),
+        Cell::from("MEM"),
         Cell::from("MEM%"),
         Cell::from("VCPUS"),
         Cell::from("NET TX"),
@@ -87,9 +89,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     let rows = domains.iter().map(|d| {
         Row::new(vec![
+            Cell::from(d.id.to_string()),
             Cell::from(d.name.clone()),
             Cell::from(state_label(&d.state)),
             Cell::from(format!("{:.1}", d.cpu_percent)),
+            Cell::from(format!("{} MB", d.memory_mb)),
             Cell::from(format!("{:.1}", d.memory_percent)),
             Cell::from(d.vcpus.to_string()),
             Cell::from(format!("{}", d.net_tx_kb)),
@@ -102,9 +106,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let table = Table::new(
         rows,
         [
+            Constraint::Length(6),
             Constraint::Percentage(22),
             Constraint::Length(10),
             Constraint::Length(8),
+            Constraint::Length(12),
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(10),
@@ -117,7 +123,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     .block(Block::default().title(" Domains ").borders(Borders::ALL));
 
     let network_header = Row::new(vec![
-        Cell::from("IFCAE"),
+        Cell::from("IFACE"),
         Cell::from("RX"),
         Cell::from("TX"),
         Cell::from("RX PPS"),

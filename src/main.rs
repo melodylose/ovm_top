@@ -20,7 +20,8 @@ use crate::collector::{net, xentop, xm};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 fn main() -> Result<()> {
-    let domains = Arc::new(Mutex::new(Vec::new()));
+    let realtime_domains = Arc::new(Mutex::new(Vec::<xentop::DomainStats>::new()));
+    let domains = Arc::new(Mutex::new(Vec::<xentop::DomainView>::new()));
     let network = Arc::new(Mutex::new(Vec::new()));
 
     let mut app = App {
@@ -35,18 +36,9 @@ fn main() -> Result<()> {
     };
 
     if std::env::var("OVM_TOP_MOCK").is_err() {
-        xentop::spawn_collector(Arc::clone(&domains))?;
-    } else {
-        let mut d = domains.lock().unwrap();
+        xentop::spawn_collector(Arc::clone(&realtime_domains))?;
 
-        d.push(xentop::DomainStats {
-            name: "Domain-0".into(),
-            state: "-----r".into(),
-            cpu_percent: 2.9,
-            memory_percent: 1.6,
-            vcpus: 20,
-            ..Default::default()
-        });
+        xentop::spawn_domain_view_collector(Arc::clone(&realtime_domains), Arc::clone(&domains));
     }
 
     net::spawn_network_collector(Arc::clone(&network));

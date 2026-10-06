@@ -12,6 +12,47 @@ pub struct XmInfo {
     pub scheduler: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct XmDomain {
+    pub name: String,
+    pub id: u32,
+    pub memory_mb: u64,
+    pub vcpus: u32,
+    pub state: String,
+    pub cpu_time: f64,
+}
+
+pub fn get_domains() -> Result<Vec<XmDomain>> {
+    let output = Command::new("xm").arg("list").output()?;
+
+    if !output.status.success() {
+        anyhow::bail!("xm list failed");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut domains = Vec::new();
+
+    for line in stdout.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+
+        if cols.len() < 6 {
+            continue;
+        }
+
+        domains.push(XmDomain {
+            name: cols[0].to_string(),
+            id: cols[1].parse().unwrap_or_default(),
+            memory_mb: cols[2].parse().unwrap_or_default(),
+            vcpus: cols[3].parse().unwrap_or_default(),
+            state: cols[4].to_string(),
+            cpu_time: cols[5].parse().unwrap_or_default(),
+        });
+    }
+
+    Ok(domains)
+}
+
 pub fn mock_xm_info() -> XmInfo {
     XmInfo {
         host: "SWB-AMS-AP7".to_string(),
