@@ -1,5 +1,6 @@
 use crate::collector::xm::XmDomain;
 use crate::log::{LogEvent, LogSource};
+use crate::topology::snapshot::{IdentitySource, SnapshotMeta, SnapshotStatus};
 use anyhow::{Context, Result};
 use std::{
     io::{BufRead, BufReader},
@@ -32,7 +33,7 @@ pub struct DomainStats {
     pub ssid: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DomainView {
     pub name: String,
     pub id: u32,
@@ -45,11 +46,15 @@ pub struct DomainView {
     pub net_rx_kb: f64,
     pub vbd_rd: u64,
     pub vbd_wr: u64,
+    pub identity_source: IdentitySource,
 }
+
+pub type DomainSnapshotMeta = SnapshotMeta;
 
 pub fn spawn_domain_view_collector(
     realtime: Arc<Mutex<Vec<DomainStats>>>,
     output: Arc<Mutex<Vec<DomainView>>>,
+    meta: Arc<Mutex<DomainSnapshotMeta>>,
     log_tx: std::sync::mpsc::Sender<LogEvent>,
 ) {
     thread::spawn(move || {
@@ -81,6 +86,16 @@ pub fn spawn_domain_view_collector(
 
             let (merged, fallback_matches, unmatched_realtime, unmatched_inventory) =
                 merge_domains_with_diagnostics(&inventory, &realtime_snapshot);
+            if let Ok(mut snapshot_meta) = meta.lock() {
+                snapshot_meta.status = if realtime_snapshot.is_empty() {
+                    SnapshotStatus::NoData
+                } else if fallback_matches > 0 || unmatched_realtime > 0 || unmatched_inventory > 0
+                {
+                    SnapshotStatus::MergeFallback
+                } else {
+                    SnapshotStatus::Live
+                };
+            }
             let diagnostic = (fallback_matches, unmatched_realtime, unmatched_inventory);
             if last_merge_diagnostic != Some(diagnostic) {
                 let event =
@@ -139,13 +154,18 @@ pub fn merge_domains_with_diagnostics(
                 .enumerate()
                 .find(|(position, x)| !used[*position] && x.name == xm.name)
                 .map(|(position, _)| position);
+            let mut identity_source = IdentitySource::Unknown;
             let matched_index = named_match.or_else(|| {
                 let fallback = (index < realtime.len() && !used[index]).then_some(index);
                 if fallback.is_some() {
                     fallback_matches += 1;
+                    identity_source = IdentitySource::StreamOrder;
                 }
                 fallback
             });
+            if named_match.is_some() {
+                identity_source = IdentitySource::FullName;
+            }
             if let Some(position) = matched_index {
                 used[position] = true;
                 matched_inventory += 1;
@@ -171,6 +191,7 @@ pub fn merge_domains_with_diagnostics(
                 vbd_rd: rt.map(|x| x.vbd_rd).unwrap_or_default(),
 
                 vbd_wr: rt.map(|x| x.vbd_wr).unwrap_or_default(),
+                identity_source,
             }
         })
         .collect::<Vec<_>>();
@@ -186,6 +207,7 @@ pub fn merge_domains_with_diagnostics(
 
 pub fn spawn_collector(
     domains: Arc<Mutex<Vec<DomainStats>>>,
+    meta: Arc<Mutex<DomainSnapshotMeta>>,
     log_tx: std::sync::mpsc::Sender<LogEvent>,
 ) -> Result<()> {
     let mut child = Command::new("xentop")
@@ -217,6 +239,7 @@ pub fn spawn_collector(
                 if !snapshot.is_empty() {
                     publish_snapshot(
                         &domains,
+                        &meta,
                         &mut snapshot,
                         &log_tx,
                         &mut duplicate_warning_sent,
@@ -233,6 +256,7 @@ pub fn spawn_collector(
         if !snapshot.is_empty() {
             publish_snapshot(
                 &domains,
+                &meta,
                 &mut snapshot,
                 &log_tx,
                 &mut duplicate_warning_sent,
@@ -292,6 +316,7 @@ fn is_header(line: &str) -> bool {
 
 fn publish_snapshot(
     output: &Arc<Mutex<Vec<DomainStats>>>,
+    meta: &Arc<Mutex<DomainSnapshotMeta>>,
     snapshot: &mut Vec<DomainStats>,
     log_tx: &std::sync::mpsc::Sender<LogEvent>,
     duplicate_warning_sent: &mut bool,
@@ -311,6 +336,11 @@ fn publish_snapshot(
     }
     if let Ok(mut shared) = output.lock() {
         *shared = std::mem::take(snapshot);
+    }
+    if let Ok(mut snapshot_meta) = meta.lock() {
+        snapshot_meta.collected_at = Some(std::time::Instant::now());
+        snapshot_meta.generation = snapshot_meta.generation.saturating_add(1);
+        snapshot_meta.status = SnapshotStatus::Live;
     }
 }
 
@@ -381,6 +411,24 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].cpu_percent, 12.5);
         assert_eq!(merged[1].cpu_percent, 34.5);
+        assert_eq!(merged[0].identity_source, IdentitySource::StreamOrder);
+        assert_eq!(merged[1].identity_source, IdentitySource::StreamOrder);
+    }
+
+    #[test]
+    fn records_full_name_identity_when_realtime_name_matches_inventory() {
+        let inventory = vec![XmDomain {
+            name: "domain-a".into(),
+            id: 7,
+            ..Default::default()
+        }];
+        let realtime = vec![realtime("domain-a", 4.0)];
+
+        let merged = merge_domains(&inventory, &realtime);
+
+        assert_eq!(merged[0].identity_source, IdentitySource::FullName);
+        assert_eq!(merged[0].id, 7);
+        assert_eq!(merged[0].cpu_percent, 4.0);
     }
 
     #[test]

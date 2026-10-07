@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Workspace UI / UX Steps 2–8
+
+- 新增 `Workspace`、`InputMode` 與帶 identity 的互斥 `DetailTarget`，並保留 `h/l/u/d/o/4/q` 舊快捷鍵。
+- UI 改為 Overview、Domains、Network、Disk、Logs、FC/SAN 的 full-screen workspace；`0` 返回 Overview，`1`–`5` 保留既有區域切換語意。
+- Overview 顯示 Xen host、Domain、Network、Disk 與 FC/SAN 健康摘要。
+- Domains Workspace 以 DomID 作為 detail identity，name 僅作 display metadata；VM-centric tree 僅顯示 host-side 可證實的 VIF、VBD、WWID 與 multipath 關係。
+- FC/SAN Workspace 新增 Overview、Ports、Targets、Multipath subviews，保留 summary/detail、map preview、path health 與 visible ranges。
+- Network 與 Disk Workspace 分離 performance/topology view；identity 與 storage scope 明確標示為 host-observed/host-side，未查詢 array metadata。
+- Logs 升級為 full-screen、memory-only Workspace，支援 level、source、case-insensitive text 與 1m/5m/15m/1h time-range filters；`c` 清除 view filters，`C` 才清除 memory buffer。
+- 新增 large/medium/small responsive detail layout，以及 `?` context help overlay；所有主要 list 保留 visible range/total。
+- Persistent Logs 寫入 `~/.local/state/ovm-top/logs/`，依 UTC 日期使用 `YYYY-MM-DD.jsonl` JSONL 檔案。
+- 單檔上限 20 MiB，使用不覆蓋既有資料的遞增 suffix rotation，並保留最近 7 個 UTC 日曆日。
+- Persistent log 檔案強制使用 Unix `0600` permission；初始化、rotation 或寫入失敗時安全降級為 memory-only，warning 直接輸出 stderr，避免 recursive logging 與 UI 中斷。
+- Startup 會載入 retention 範圍內的 daily/rotation JSONL，解析 escaped message 後依 timestamp 排序，並將最新 1000 筆回填 Logs memory buffer；個別檔案或資料列損壞只輸出 warning，不停用後續 persistent writing。
+
 ### UI Focus 與互動
 
 - Log 面板預設隱藏，避免佔用主畫面空間。
@@ -46,6 +61,29 @@
 - 以 snapshot row 保留同名輸出，並在 identity 不匹配時使用 stream order fallback。
 - 新增 merge healthy、fallback、inventory unmatched 與 realtime unmatched diagnostics。
 - Domain 資料更新已於另一台 Hypervisor 驗證可正常顯示。
+- 新增 Domain snapshot generation、collection time 與 freshness status 基礎模型。
+- Domains panel 顯示 `LIVE`、`STALE`、`FALLBACK` 與 `NO DATA` 狀態。
+- 建立初版 topology snapshot module，為後續 VM-to-Storage relationship layer 預留介面。
+- 架構分析草稿改列入 `.gitignore`，僅保留於本機，不納入版本控制。
+- 建立 `topology` snapshot、Domain identity、VBD/VIF 與 host network relationship 基礎模型。
+- 新增 xenstore VBD/VIF reader 與 `/sys/class/net` bridge/bond topology reader。
+- 新增 Multipath `Healthy`、`Degraded`、`Failed`、`Unknown` health model。
+- Topology collector 開始定期收集 Domain identity、VBD、VIF、bridge、bond 與 physical NIC 關係。
+- Domain panel 顯示目前 topology snapshot 的 VBD/VIF 數量。
+- Multipath Summary/Detail 顯示 path health 狀態。
+- VBD topology 會嘗試解析 physical-device、host block device 與 multipath dm UUID/WWID。
+- VIF topology 會解析 MAC 與 `/sys/class/net/<vif>/brport/bridge` bridge 關係。
+- Topology snapshot 顯示 Storage map 數量，Domains panel 顯示 VBD/VIF/Multipath topology counts。
+- Domains Focus 新增 `l` 開啟 Domain Detail tree，`h`/`Esc` 返回 Summary。
+- Domain Detail 顯示 DomID、VIF/bridge、VBD、host block device 與可辨識的 WWID。
+- VBD mapping 新增 `Exact`、`Derived`、`Fallback`、`Unknown` confidence 標示。
+- WWID 解析優先使用 `/dev/disk/by-id/scsi-*`，再 fallback 至 dm UUID。
+- `by-id/scsi-*` mapping 標示為 `Exact`；dm UUID 標示為 `Derived` 或 `Fallback`，不再誤標為 exact。
+- Domain Detail 會在 VBD 下方顯示對應 multipath mapper、path health 與 Host-side scope。
+- Network Focus 新增 `l` 開啟 Network Detail tree，顯示 bridge、bond、master 與 member 關係。
+- Network Detail 使用獨立 scroll state，`h`/`Esc` 返回 Network Summary。
+- Storage topology 明確限制為 Host-side，涵蓋 VBD、block device、WWID、dm-X、multipath 與 FC path。
+- 移除並禁止 SCV3020 API/CLI、Storage Manager 與 Array-side metadata 接入；不可取得資料以 Unknown/Unavailable 表示。
 
 ### Table Scrolling
 
@@ -91,8 +129,8 @@
 
 - 保留 Multipath summary 作為預設顯示模式。
 - 新增 FC/SAN map detail view 與目前 map 選取狀態。
-- 新增 `Enter/d` 開啟目前 multipath map 的 path detail。
-- 新增 `Esc` 返回 Multipath summary。
+- 新增 `l` 開啟目前 multipath map 的 path detail。
+- 新增 `h`/`Esc` 返回 Multipath summary。
 - 顯示 H:C:T:L、device、major/minor 與 path state。
 - Detail view 顯示 map-level Disk I/O。
 - FC/SAN 設定選單可切換 Path detail 顯示狀態，預設為隱藏。
@@ -109,3 +147,9 @@
 - `4` 統一控制 Logs 顯示與隱藏。
 - 修正 Detail Preview 時 Summary 父層高亮回到第一個 map 的問題。
 - Detail Preview 會同步 Summary context 與 viewport，返回 Summary 後保留最後查看的 WWID。
+- Domain、Network 與 FC Detail navigation 新增共用 `DetailTarget` 狀態，避免多個 Detail overlay 同時開啟。
+- Topology collector 在 xenstore、network 或 multipath 部分讀取失敗時改標示 `STALE`，不再將不完整資料標示為 `LIVE`。
+- Domains 標題同步顯示 Domain snapshot 與 Topology snapshot freshness 狀態。
+- 新增 `STORAGE` log source，記錄 multipath topology 讀取失敗。
+- Domains、Network、Disk、FC/SAN、Logs 與 Detail tree 標題新增 visible range / total，避免 viewport 截斷造成資料不存在的誤判。
+- `ovm-top_ui_ux_improvement_draft.md` 列入 `.gitignore`，僅作為本機 UI/UX 規劃草稿。

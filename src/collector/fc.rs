@@ -11,6 +11,7 @@ use std::{
 use crate::{
     collector::disk::{self, DiskRate, DiskStats},
     log::{LogEvent, LogSource},
+    topology::snapshot::{StorageHealth, storage_health},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -58,6 +59,7 @@ pub struct MultipathMap {
     pub status: String,
     pub active_paths: u32,
     pub total_paths: u32,
+    pub health: StorageHealth,
     pub io: Option<DiskRate>,
     pub paths: Vec<MultipathPath>,
 }
@@ -103,7 +105,7 @@ pub fn spawn_fc_collector(output: Arc<Mutex<FcSnapshot>>, log_tx: Sender<LogEven
                 }
                 Err(error) => {
                     let _ = log_tx.send(LogEvent::warn(
-                        LogSource::Domain,
+                        LogSource::Storage,
                         format!("failed to refresh FC/SAN inventory: {error}"),
                     ));
                 }
@@ -257,6 +259,7 @@ fn push_compellent_map(maps: &mut Vec<MultipathMap>, map: Option<MultipathMap>) 
         .iter()
         .filter(|path| path.state.contains("active") && path.state.contains("ready"))
         .count() as u32;
+    map.health = storage_health(map.active_paths, map.total_paths);
     maps.push(map);
 }
 

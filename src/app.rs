@@ -5,28 +5,94 @@ use std::{
 };
 
 use crate::{
-    collector::{disk::DiskRate, fc::FcSnapshot, net::NetRate, xentop::DomainView, xm::XmInfo},
-    log::{LogEntry, LogEvent},
+    collector::{
+        disk::DiskRate,
+        fc::FcSnapshot,
+        net::NetRate,
+        xentop::{DomainSnapshotMeta, DomainView},
+        xm::XmInfo,
+    },
+    log::{LogEntry, LogEvent, LogLevel, LogSource, PersistentLogger},
+    topology::snapshot::TopologySnapshot,
 };
 
-const MAX_LOG_ENTRIES: usize = 1_000;
+pub(crate) const MAX_LOG_ENTRIES: usize = 1_000;
 
-#[derive(Debug, Clone, Copy, Default)]
-pub enum LogFilter {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogTimeRange {
     #[default]
     All,
-    WarningsAndErrors,
-    ErrorsOnly,
+    LastMinute,
+    LastFiveMinutes,
+    LastFifteenMinutes,
+    LastHour,
+}
+
+impl LogTimeRange {
+    pub fn seconds(self) -> Option<u64> {
+        match self {
+            Self::All => None,
+            Self::LastMinute => Some(60),
+            Self::LastFiveMinutes => Some(300),
+            Self::LastFifteenMinutes => Some(900),
+            Self::LastHour => Some(3600),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LogFilter {
+    pub min_level: Option<LogLevel>,
+    pub source: Option<LogSource>,
+    pub text: String,
+    pub time_range: LogTimeRange,
 }
 
 impl LogFilter {
-    pub fn matches(self, level: crate::log::LogLevel) -> bool {
-        match self {
-            Self::All => true,
-            Self::WarningsAndErrors => !matches!(level, crate::log::LogLevel::Info),
-            Self::ErrorsOnly => matches!(level, crate::log::LogLevel::Error),
-        }
+    pub fn matches(&self, entry: &LogEntry) -> bool {
+        let level_matches = match self.min_level {
+            None => true,
+            Some(LogLevel::Info) => true,
+            Some(LogLevel::Warn) => entry.level != LogLevel::Info,
+            Some(LogLevel::Error) => entry.level == LogLevel::Error,
+        };
+        let source_matches = self.source.is_none_or(|source| source == entry.source);
+        let text_matches = self.text.is_empty()
+            || entry
+                .message
+                .to_ascii_lowercase()
+                .contains(&self.text.to_ascii_lowercase());
+        let time_matches = self.time_range.seconds().is_none_or(|seconds| {
+            std::time::SystemTime::now()
+                .duration_since(entry.timestamp)
+                .map(|age| age.as_secs() <= seconds)
+                .unwrap_or(true)
+        });
+        level_matches && source_matches && text_matches && time_matches
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Workspace {
+    #[default]
+    Overview,
+    Domains,
+    Network,
+    Disk,
+    Logs,
+    FcSan,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputMode {
+    #[default]
+    Normal,
+    Detail,
+    ViewMenu,
+    Filter,
+    Search,
+    TimeRange,
+    Help,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -41,6 +107,7 @@ pub enum Focus {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FcView {
+    Overview,
     Ports,
     Targets,
     #[default]
@@ -52,6 +119,30 @@ pub enum FcPanelMode {
     #[default]
     Summary,
     Detail,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DetailTarget {
+    #[default]
+    None,
+    Domain(u32),
+    Network(String),
+    Disk(String),
+    Multipath(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NetworkView {
+    #[default]
+    Performance,
+    Topology,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiskView {
+    #[default]
+    Performance,
+    Topology,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,24 +180,43 @@ pub enum ScrollResult {
 pub struct App {
     pub xm_info: XmInfo,
     pub domains: Arc<Mutex<Vec<DomainView>>>,
+    pub domain_meta: Arc<Mutex<DomainSnapshotMeta>>,
+    pub topology: Arc<Mutex<TopologySnapshot>>,
     pub network: Arc<Mutex<Vec<NetRate>>>,
     pub disk: Arc<Mutex<Vec<DiskRate>>>,
     pub fc: Arc<Mutex<FcSnapshot>>,
     pub focus: Focus,
+    pub workspace: Workspace,
+    pub previous_workspace: Workspace,
+    pub input_mode: InputMode,
     pub domain_scroll: ScrollState,
+    pub domain_selected: Option<usize>,
+    pub domain_detail_scroll: ScrollState,
+    pub domain_detail_open: bool,
+    pub domain_detail_index: Option<usize>,
     pub network_scroll: ScrollState,
+    pub network_selected: Option<usize>,
+    pub network_detail_scroll: ScrollState,
+    pub network_detail_open: bool,
+    pub network_view: NetworkView,
     pub disk_scroll: ScrollState,
+    pub disk_selected: Option<usize>,
+    pub disk_detail_scroll: ScrollState,
+    pub disk_view: DiskView,
     pub fc_scroll: ScrollState,
     pub fc_selected: Option<usize>,
     pub fc_detail_scroll: ScrollState,
     pub fc_panel_mode: FcPanelMode,
     pub fc_detail_map: Option<usize>,
+    pub detail_target: DetailTarget,
     pub fc_config: FcDisplayConfig,
     pub fc_config_open: bool,
     pub fc_config_index: usize,
     pub logs: VecDeque<LogEntry>,
+    pub persistent_logger: Option<PersistentLogger>,
     pub log_scroll: ScrollState,
     pub log_filter: LogFilter,
+    pub search_input: String,
     pub show_logs: bool,
     pub(crate) last_scroll_boundary: Option<(Focus, bool)>,
 }
@@ -155,8 +265,13 @@ impl App {
 
     pub fn set_scroll_metrics(&mut self, focus: Focus, total: usize, viewport: usize) {
         let state = match focus {
+            Focus::Domains if self.domain_detail_open => &mut self.domain_detail_scroll,
             Focus::Domains => &mut self.domain_scroll,
+            Focus::Network if self.network_detail_open => &mut self.network_detail_scroll,
             Focus::Network => &mut self.network_scroll,
+            Focus::Disk if matches!(self.detail_target, DetailTarget::Disk(_)) => {
+                &mut self.disk_detail_scroll
+            }
             Focus::Disk => &mut self.disk_scroll,
             Focus::Fc if self.fc_panel_mode == FcPanelMode::Detail => &mut self.fc_detail_scroll,
             Focus::Fc => &mut self.fc_scroll,
@@ -169,8 +284,13 @@ impl App {
 
     pub fn current_scroll_state(&self) -> ScrollState {
         match self.focus {
+            Focus::Domains if self.domain_detail_open => self.domain_detail_scroll,
             Focus::Domains => self.domain_scroll,
+            Focus::Network if self.network_detail_open => self.network_detail_scroll,
             Focus::Network => self.network_scroll,
+            Focus::Disk if matches!(self.detail_target, DetailTarget::Disk(_)) => {
+                self.disk_detail_scroll
+            }
             Focus::Disk => self.disk_scroll,
             Focus::Fc if self.fc_panel_mode == FcPanelMode::Detail => self.fc_detail_scroll,
             Focus::Fc => self.fc_scroll,
@@ -180,8 +300,13 @@ impl App {
 
     fn scroll_state_mut(&mut self) -> &mut ScrollState {
         match self.focus {
+            Focus::Domains if self.domain_detail_open => &mut self.domain_detail_scroll,
             Focus::Domains => &mut self.domain_scroll,
+            Focus::Network if self.network_detail_open => &mut self.network_detail_scroll,
             Focus::Network => &mut self.network_scroll,
+            Focus::Disk if matches!(self.detail_target, DetailTarget::Disk(_)) => {
+                &mut self.disk_detail_scroll
+            }
             Focus::Disk => &mut self.disk_scroll,
             Focus::Fc if self.fc_panel_mode == FcPanelMode::Detail => &mut self.fc_detail_scroll,
             Focus::Fc => &mut self.fc_scroll,
@@ -191,11 +316,143 @@ impl App {
 
     pub fn focus_logs(&mut self) {
         self.show_logs = true;
-        self.focus = Focus::Logs;
+        self.set_workspace(Workspace::Logs);
+    }
+
+    pub fn set_workspace(&mut self, workspace: Workspace) {
+        if self.workspace != workspace {
+            self.previous_workspace = self.workspace;
+            self.domain_detail_open = false;
+            self.network_detail_open = false;
+            self.fc_panel_mode = FcPanelMode::Summary;
+            self.fc_detail_map = None;
+            self.detail_target = DetailTarget::None;
+        }
+        self.workspace = workspace;
+        self.focus = match workspace {
+            Workspace::Overview | Workspace::Domains => Focus::Domains,
+            Workspace::Network => Focus::Network,
+            Workspace::Disk => Focus::Disk,
+            Workspace::Logs => Focus::Logs,
+            Workspace::FcSan => Focus::Fc,
+        };
+        self.input_mode = InputMode::Normal;
+        self.last_scroll_boundary = None;
+    }
+
+    pub fn open_domain_detail(&mut self) -> bool {
+        let count = self
+            .domains
+            .lock()
+            .map(|domains| domains.len())
+            .unwrap_or(0);
+        if count == 0 {
+            return false;
+        }
+        self.close_network_detail();
+        if self.fc_panel_mode == FcPanelMode::Detail {
+            self.close_fc_detail();
+        }
+        let index = self
+            .domain_selected
+            .unwrap_or(self.domain_scroll.offset)
+            .min(count - 1);
+        self.domain_detail_index = Some(index);
+        self.domain_detail_scroll = ScrollState::default();
+        self.domain_detail_open = true;
+        let domid = self
+            .domains
+            .lock()
+            .ok()
+            .and_then(|domains| domains.get(index).map(|domain| domain.id))
+            .unwrap_or_default();
+        self.detail_target = DetailTarget::Domain(domid);
+        self.input_mode = InputMode::Detail;
+        true
+    }
+
+    pub fn open_network_detail(&mut self) -> bool {
+        let available = self
+            .topology
+            .lock()
+            .map(|snapshot| !snapshot.interfaces.is_empty())
+            .unwrap_or(false);
+        if !available {
+            return false;
+        }
+        self.close_domain_detail();
+        if self.fc_panel_mode == FcPanelMode::Detail {
+            self.close_fc_detail();
+        }
+        self.network_detail_scroll = ScrollState::default();
+        self.network_detail_open = true;
+        let name =
+            self.network
+                .lock()
+                .ok()
+                .and_then(|network| {
+                    network
+                        .get(self.network_selected.unwrap_or(self.network_scroll.offset))
+                        .map(|item| item.name.clone())
+                })
+                .or_else(|| {
+                    self.topology.lock().ok().and_then(|snapshot| {
+                        snapshot.interfaces.first().map(|item| item.name.clone())
+                    })
+                })
+                .unwrap_or_else(|| "Unknown".to_string());
+        self.detail_target = DetailTarget::Network(name);
+        self.input_mode = InputMode::Detail;
+        true
+    }
+
+    pub fn close_network_detail(&mut self) {
+        self.network_detail_open = false;
+        self.network_detail_scroll = ScrollState::default();
+        if matches!(self.detail_target, DetailTarget::Network(_)) {
+            self.detail_target = DetailTarget::None;
+            self.input_mode = InputMode::Normal;
+        }
+    }
+
+    pub fn close_domain_detail(&mut self) {
+        self.domain_detail_open = false;
+        self.domain_detail_index = None;
+        self.domain_detail_scroll = ScrollState::default();
+        if matches!(self.detail_target, DetailTarget::Domain(_)) {
+            self.detail_target = DetailTarget::None;
+            self.input_mode = InputMode::Normal;
+        }
+    }
+
+    pub fn open_disk_detail(&mut self) -> bool {
+        let name = self.disk.lock().ok().and_then(|disks| {
+            disks
+                .get(self.disk_selected.unwrap_or(self.disk_scroll.offset))
+                .map(|disk| disk.name.clone())
+        });
+        let Some(name) = name else { return false };
+        self.close_domain_detail();
+        self.close_network_detail();
+        if self.fc_panel_mode == FcPanelMode::Detail {
+            self.close_fc_detail();
+        }
+        self.disk_detail_scroll = ScrollState::default();
+        self.detail_target = DetailTarget::Disk(name);
+        self.input_mode = InputMode::Detail;
+        true
+    }
+
+    pub fn close_disk_detail(&mut self) {
+        if matches!(self.detail_target, DetailTarget::Disk(_)) {
+            self.detail_target = DetailTarget::None;
+            self.disk_detail_scroll = ScrollState::default();
+            self.input_mode = InputMode::Normal;
+        }
     }
 
     pub fn focus_fc(&mut self) {
-        self.focus = Focus::Fc;
+        self.set_workspace(Workspace::FcSan);
     }
 
     pub fn open_fc_detail(&mut self) -> bool {
@@ -207,12 +464,22 @@ impl App {
         if map_count == 0 {
             return false;
         }
+        self.close_domain_detail();
+        self.close_network_detail();
         let selected = self.fc_selected.unwrap_or(0).min(map_count - 1);
         self.fc_detail_map = Some(selected);
         self.ensure_fc_map_visible(selected);
         self.fc_selected = None;
         self.fc_detail_scroll = ScrollState::default();
         self.fc_panel_mode = FcPanelMode::Detail;
+        let wwid = self
+            .fc
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.maps.get(selected).map(|map| map.wwid.clone()))
+            .unwrap_or_else(|| "Unknown".to_string());
+        self.detail_target = DetailTarget::Multipath(wwid);
+        self.input_mode = InputMode::Detail;
         true
     }
 
@@ -222,6 +489,10 @@ impl App {
         self.fc_detail_map = None;
         self.fc_selected = selected.or(Some(self.fc_scroll.offset));
         self.fc_detail_scroll = ScrollState::default();
+        if matches!(self.detail_target, DetailTarget::Multipath(_)) {
+            self.detail_target = DetailTarget::None;
+            self.input_mode = InputMode::Normal;
+        }
     }
 
     pub fn preview_fc_map(&mut self, delta: isize) -> bool {
@@ -248,6 +519,11 @@ impl App {
         }
 
         self.fc_detail_map = Some(next);
+        if let Ok(snapshot) = self.fc.lock()
+            && let Some(map) = snapshot.maps.get(next)
+        {
+            self.detail_target = DetailTarget::Multipath(map.wwid.clone());
+        }
         self.ensure_fc_map_visible(next);
         self.fc_detail_scroll = ScrollState::default();
         true
@@ -310,25 +586,28 @@ impl App {
     pub fn open_fc_config(&mut self) {
         self.fc_config_open = true;
         self.fc_config_index = match self.fc_config.view {
-            FcView::Ports => 0,
-            FcView::Targets => 1,
-            FcView::Multipath => 2,
+            FcView::Overview => 0,
+            FcView::Ports => 1,
+            FcView::Targets => 2,
+            FcView::Multipath => 3,
         };
+        self.input_mode = InputMode::ViewMenu;
     }
 
     pub fn move_fc_config(&mut self, down: bool) {
         if down {
-            self.fc_config_index = (self.fc_config_index + 1).min(3);
+            self.fc_config_index = (self.fc_config_index + 1).min(4);
         } else {
             self.fc_config_index = self.fc_config_index.saturating_sub(1);
         }
     }
 
     pub fn apply_fc_config(&mut self) {
-        if self.fc_config_index <= 2 {
+        if self.fc_config_index <= 3 {
             self.fc_config.view = match self.fc_config_index {
-                0 => FcView::Ports,
-                1 => FcView::Targets,
+                0 => FcView::Overview,
+                1 => FcView::Ports,
+                2 => FcView::Targets,
                 _ => FcView::Multipath,
             };
             self.fc_scroll.offset = 0;
@@ -343,12 +622,18 @@ impl App {
             }
         }
         self.fc_config_open = false;
+        self.input_mode = InputMode::Normal;
     }
 
     pub fn hide_logs(&mut self) {
         self.show_logs = false;
-        if self.focus == Focus::Logs {
-            self.focus = Focus::Domains;
+        if self.workspace == Workspace::Logs {
+            let target = if self.previous_workspace == Workspace::Logs {
+                Workspace::Overview
+            } else {
+                self.previous_workspace
+            };
+            self.set_workspace(target);
         }
     }
 
@@ -362,7 +647,16 @@ impl App {
                         .total
                         .saturating_sub(self.log_scroll.viewport);
 
-            self.logs.push_back(event.into());
+            let entry = LogEntry::from(event);
+            if let Some(logger) = self.persistent_logger.as_mut()
+                && let Err(error) = logger.write(&entry)
+            {
+                eprintln!(
+                    "ovm-top warning: persistent logging disabled after write failure: {error}"
+                );
+                self.persistent_logger = None;
+            }
+            self.logs.push_back(entry);
             if self.logs.len() > MAX_LOG_ENTRIES {
                 self.logs.pop_front();
             }
@@ -370,7 +664,7 @@ impl App {
             self.log_scroll.total = self
                 .logs
                 .iter()
-                .filter(|entry| self.log_filter.matches(entry.level))
+                .filter(|entry| self.log_filter.matches(entry))
                 .count();
             if was_at_log_bottom {
                 self.log_scroll.offset = self
@@ -388,13 +682,91 @@ impl App {
     }
 
     pub fn cycle_log_filter(&mut self) {
-        self.log_filter = match self.log_filter {
-            LogFilter::All => LogFilter::WarningsAndErrors,
-            LogFilter::WarningsAndErrors => LogFilter::ErrorsOnly,
-            LogFilter::ErrorsOnly => LogFilter::All,
+        self.log_filter.min_level = match self.log_filter.min_level {
+            None => Some(LogLevel::Warn),
+            Some(LogLevel::Warn) => Some(LogLevel::Error),
+            _ => None,
         };
         self.log_scroll.offset = 0;
         self.last_scroll_boundary = None;
+    }
+
+    pub fn select_workspace_row(&mut self, down: bool) -> bool {
+        let (selected, scroll, count) = match self.focus {
+            Focus::Domains if !self.domain_detail_open => (
+                &mut self.domain_selected,
+                &mut self.domain_scroll,
+                self.domains
+                    .lock()
+                    .map(|items| items.len())
+                    .unwrap_or_default(),
+            ),
+            Focus::Network if !self.network_detail_open => (
+                &mut self.network_selected,
+                &mut self.network_scroll,
+                self.network
+                    .lock()
+                    .map(|items| items.len())
+                    .unwrap_or_default(),
+            ),
+            Focus::Disk if !matches!(self.detail_target, DetailTarget::Disk(_)) => (
+                &mut self.disk_selected,
+                &mut self.disk_scroll,
+                self.disk
+                    .lock()
+                    .map(|items| items.len())
+                    .unwrap_or_default(),
+            ),
+            _ => return false,
+        };
+        if count == 0 {
+            *selected = None;
+            return true;
+        }
+        let current = selected.unwrap_or(scroll.offset).min(count - 1);
+        let next = if down {
+            current.saturating_add(1).min(count - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        *selected = Some(next);
+        let visible = scroll.viewport.max(1);
+        if next < scroll.offset {
+            scroll.offset = next;
+        } else if next >= scroll.offset.saturating_add(visible) {
+            scroll.offset = next + 1 - visible;
+        }
+        true
+    }
+
+    pub fn cycle_log_source(&mut self) {
+        self.log_filter.source = match self.log_filter.source {
+            None => Some(LogSource::System),
+            Some(LogSource::System) => Some(LogSource::Domain),
+            Some(LogSource::Domain) => Some(LogSource::Network),
+            Some(LogSource::Network) => Some(LogSource::Disk),
+            Some(LogSource::Disk) => Some(LogSource::Storage),
+            Some(LogSource::Storage) => Some(LogSource::Ui),
+            Some(LogSource::Ui) => None,
+        };
+        self.log_scroll.offset = 0;
+    }
+
+    pub fn cycle_log_time_range(&mut self) {
+        self.log_filter.time_range = match self.log_filter.time_range {
+            LogTimeRange::All => LogTimeRange::LastMinute,
+            LogTimeRange::LastMinute => LogTimeRange::LastFiveMinutes,
+            LogTimeRange::LastFiveMinutes => LogTimeRange::LastFifteenMinutes,
+            LogTimeRange::LastFifteenMinutes => LogTimeRange::LastHour,
+            LogTimeRange::LastHour => LogTimeRange::All,
+        };
+        self.log_scroll.offset = 0;
+    }
+
+    pub fn clear_log_view(&mut self) {
+        self.log_filter = LogFilter::default();
+        self.search_input.clear();
+        self.log_scroll.offset = 0;
     }
 }
 
@@ -442,6 +814,39 @@ mod tests {
 
         assert_eq!(app.log_scroll.total, 21);
         assert_eq!(app.log_scroll.offset, 10);
+    }
+
+    #[test]
+    fn persistent_rotation_failure_keeps_memory_logging_available() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ovm-top-app-fallback-{}-{unique}",
+            std::process::id()
+        ));
+        let logger = crate::log::PersistentLogger::with_config(
+            root.clone(),
+            std::time::SystemTime::now(),
+            1,
+            7,
+        )
+        .unwrap();
+        let mut app = App {
+            persistent_logger: Some(logger),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        tx.send(LogEvent::info(LogSource::Ui, "first")).unwrap();
+        app.drain_logs(&rx);
+        std::fs::remove_dir_all(&root).unwrap();
+        tx.send(LogEvent::info(LogSource::Ui, "second")).unwrap();
+
+        app.drain_logs(&rx);
+
+        assert_eq!(app.logs.len(), 2);
+        assert!(app.persistent_logger.is_none());
     }
 
     fn app_with_fc_maps(count: usize) -> App {
@@ -493,6 +898,42 @@ mod tests {
         app.close_fc_detail();
         assert_eq!(app.fc_panel_mode, FcPanelMode::Summary);
         assert_eq!(app.fc_selected, Some(1));
+        assert_eq!(app.detail_target, DetailTarget::None);
+    }
+
+    #[test]
+    fn detail_targets_are_mutually_exclusive() {
+        let mut app = app_with_fc_maps(1);
+        app.domains = Arc::new(Mutex::new(vec![DomainView {
+            name: "domain-a".into(),
+            id: 1,
+            state: "-b----".into(),
+            memory_mb: 1,
+            vcpus: 1,
+            cpu_percent: 0.0,
+            memory_percent: 0.0,
+            net_tx_kb: 0.0,
+            net_rx_kb: 0.0,
+            vbd_rd: 0,
+            vbd_wr: 0,
+            identity_source: crate::topology::snapshot::IdentitySource::FullName,
+        }]));
+        app.topology = Arc::new(Mutex::new(TopologySnapshot {
+            interfaces: vec![crate::topology::snapshot::NetInterface {
+                name: "xenbr0".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+
+        assert!(app.open_domain_detail());
+        assert_eq!(app.detail_target, DetailTarget::Domain(1));
+        assert!(app.open_network_detail());
+        assert!(!app.domain_detail_open);
+        assert_eq!(app.detail_target, DetailTarget::Network("xenbr0".into()));
+        assert!(app.open_fc_detail());
+        assert!(!app.network_detail_open);
+        assert_eq!(app.detail_target, DetailTarget::Multipath("wwid-0".into()));
     }
 
     #[test]

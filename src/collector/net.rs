@@ -1,4 +1,5 @@
 use crate::log::{LogEvent, LogSource};
+use crate::topology::snapshot::NetInterface;
 use anyhow::Result;
 use std::{
     collections::HashMap,
@@ -134,5 +135,47 @@ pub fn read_net_dev() -> Result<Vec<NetStats>> {
         interfaces.push(stats);
     }
 
+    Ok(interfaces)
+}
+
+pub fn read_net_topology() -> Result<Vec<NetInterface>> {
+    let mut interfaces = Vec::new();
+    for entry in fs::read_dir("/sys/class/net")? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let kind = if path.join("bonding").exists() {
+            "bond"
+        } else if path.join("bridge").exists() {
+            "bridge"
+        } else if name.starts_with("vif") {
+            "vif"
+        } else if path.join("device").exists() {
+            "physical"
+        } else {
+            "virtual"
+        };
+        let master = fs::read_link(path.join("master")).ok().and_then(|link| {
+            link.file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+        });
+        let members = if kind == "bond" {
+            fs::read_to_string(format!("/proc/net/bonding/{name}"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.strip_prefix("Slave Interface: "))
+                .map(str::to_string)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        interfaces.push(NetInterface {
+            name,
+            kind: kind.to_string(),
+            master,
+            members,
+        });
+    }
+    interfaces.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(interfaces)
 }
