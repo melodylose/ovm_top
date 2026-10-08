@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::log::{LogEvent, LogSource};
+use crate::log::{LogEvent, LogSource, WarningSuppressor};
 
 const SECTOR_SIZE: u64 = 512;
 
@@ -33,13 +33,17 @@ pub struct DiskRate {
 
 pub fn spawn_disk_collector(output: Arc<Mutex<Vec<DiskRate>>>, log_tx: Sender<LogEvent>) {
     thread::spawn(move || {
+        let mut warnings = WarningSuppressor::default();
         let mut previous = match read_diskstats() {
             Ok(stats) => stats,
             Err(error) => {
-                let _ = log_tx.send(LogEvent::error(
-                    LogSource::Disk,
-                    format!("failed to read /proc/diskstats: {error}"),
-                ));
+                warnings.emit(
+                    &log_tx,
+                    LogEvent::error(
+                        LogSource::Disk,
+                        format!("failed to read /proc/diskstats: {error}"),
+                    ),
+                );
                 return;
             }
         };
@@ -51,10 +55,13 @@ pub fn spawn_disk_collector(output: Arc<Mutex<Vec<DiskRate>>>, log_tx: Sender<Lo
             let current = match read_diskstats() {
                 Ok(stats) => stats,
                 Err(error) => {
-                    let _ = log_tx.send(LogEvent::warn(
-                        LogSource::Disk,
-                        format!("failed to refresh /proc/diskstats: {error}"),
-                    ));
+                    warnings.emit(
+                        &log_tx,
+                        LogEvent::warn(
+                            LogSource::Disk,
+                            format!("failed to refresh /proc/diskstats: {error}"),
+                        ),
+                    );
                     continue;
                 }
             };
@@ -77,11 +84,30 @@ pub fn calculate_rates(
     current: &[DiskStats],
     elapsed: Duration,
 ) -> Vec<DiskRate> {
-    current
+    let mut rates: Vec<_> = current
         .iter()
         .filter(|stat| is_display_device(&stat.name))
         .filter_map(|curr| calculate_rate(previous, curr, elapsed))
-        .collect()
+        .collect();
+    rates.sort_by(|a, b| compare_disk_names(&a.name, &b.name));
+    rates
+}
+
+fn compare_disk_names(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_prefix = a.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let b_prefix = b.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let a_letters = &a[a_prefix.len()..];
+    let b_letters = &b[b_prefix.len()..];
+    a_prefix
+        .cmp(b_prefix)
+        .then_with(|| disk_letter_index(a_letters).cmp(&disk_letter_index(b_letters)))
+        .then_with(|| a.cmp(b))
+}
+
+fn disk_letter_index(value: &str) -> u64 {
+    value
+        .bytes()
+        .fold(0, |index, byte| index * 26 + u64::from(byte - b'a' + 1))
 }
 
 pub fn calculate_rate(
@@ -186,5 +212,12 @@ mod tests {
         assert!(!is_display_device("sda1"));
         assert!(!is_display_device("loop0"));
         assert!(!is_display_device("dm-0"));
+    }
+
+    #[test]
+    fn disk_names_use_natural_device_order() {
+        let mut names = ["sdaa", "sdr", "sdb", "sda"];
+        names.sort_by(|a, b| compare_disk_names(a, b));
+        assert_eq!(names, ["sda", "sdb", "sdr", "sdaa"]);
     }
 }

@@ -150,6 +150,7 @@ fn run(
 ) -> Result<()> {
     loop {
         app.drain_logs(log_rx);
+        app.reconcile_fc_detail();
         terminal.draw(|frame| {
             ui::draw(frame, app);
         })?;

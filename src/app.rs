@@ -495,6 +495,42 @@ impl App {
         }
     }
 
+    /// Close detail when a refresh removed the map it was showing.
+    pub fn reconcile_fc_detail(&mut self) {
+        if self.fc_panel_mode != FcPanelMode::Detail {
+            return;
+        }
+        let Some(wwid) = (match &self.detail_target {
+            DetailTarget::Multipath(wwid) => Some(wwid.clone()),
+            _ => None,
+        }) else {
+            self.close_fc_detail();
+            return;
+        };
+
+        let index = self
+            .fc
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.maps.iter().position(|map| map.wwid == wwid));
+        let Some(index) = index else {
+            self.close_fc_detail();
+            if let Ok(snapshot) = self.fc.lock() {
+                self.fc_selected = if snapshot.maps.is_empty() {
+                    None
+                } else {
+                    self.fc_selected
+                        .map(|selected| selected.min(snapshot.maps.len() - 1))
+                };
+            }
+            return;
+        };
+
+        // The index is only a viewport/selection cache; WWID is the identity.
+        self.fc_detail_map = Some(index);
+        self.ensure_fc_map_visible(index);
+    }
+
     pub fn preview_fc_map(&mut self, delta: isize) -> bool {
         let map_count = self
             .fc
@@ -950,5 +986,33 @@ mod tests {
         assert!(!app.preview_fc_map(-1));
         assert!(app.preview_fc_map(1));
         assert_eq!(app.fc_detail_map, Some(1));
+    }
+
+    #[test]
+    fn fc_detail_closes_when_refresh_removes_selected_map() {
+        let mut app = app_with_fc_maps(2);
+        app.fc_selected = Some(1);
+        assert!(app.open_fc_detail());
+
+        app.fc.lock().unwrap().maps.pop();
+        app.reconcile_fc_detail();
+
+        assert_eq!(app.fc_panel_mode, FcPanelMode::Summary);
+        assert_eq!(app.fc_detail_map, None);
+        assert_eq!(app.detail_target, DetailTarget::None);
+        assert_eq!(app.fc_selected, Some(0));
+    }
+
+    #[test]
+    fn fc_detail_follows_wwid_when_refresh_reorders_maps() {
+        let mut app = app_with_fc_maps(2);
+        app.fc_selected = Some(1);
+        assert!(app.open_fc_detail());
+
+        app.fc.lock().unwrap().maps.swap(0, 1);
+        app.reconcile_fc_detail();
+
+        assert_eq!(app.detail_target, DetailTarget::Multipath("wwid-1".into()));
+        assert_eq!(app.fc_detail_map, Some(0));
     }
 }

@@ -50,7 +50,39 @@ pub fn get_domains() -> Result<Vec<XmDomain>> {
         });
     }
 
+    domains.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.name.cmp(&b.name)));
     Ok(domains)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domains_are_sorted_by_numeric_id_then_name() {
+        let mut domains = vec![
+            XmDomain {
+                name: "zeta".into(),
+                id: 10,
+                ..Default::default()
+            },
+            XmDomain {
+                name: "beta".into(),
+                id: 2,
+                ..Default::default()
+            },
+            XmDomain {
+                name: "alpha".into(),
+                id: 2,
+                ..Default::default()
+            },
+        ];
+        domains.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.name.cmp(&b.name)));
+        assert_eq!(
+            domains.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["alpha", "beta", "zeta"]
+        );
+    }
 }
 
 pub fn mock_xm_info() -> XmInfo {

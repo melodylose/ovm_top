@@ -12,14 +12,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub const PERSISTENT_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
 pub const PERSISTENT_LOG_RETENTION_DAYS: i64 = 7;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogLevel {
     Info,
     Warn,
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogSource {
     System,
     Disk,
@@ -77,6 +77,29 @@ impl From<LogEvent> for LogEntry {
             level: event.level,
             source: event.source,
             message: event.message,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct WarningSuppressor {
+    counts: HashMap<(LogLevel, LogSource, String), u64>,
+}
+
+impl WarningSuppressor {
+    pub fn emit(&mut self, sender: &std::sync::mpsc::Sender<LogEvent>, mut event: LogEvent) {
+        if event.level == LogLevel::Info {
+            let _ = sender.send(event);
+            return;
+        }
+        let key = (event.level, event.source, event.message.clone());
+        let count = self.counts.entry(key).or_default();
+        *count = count.saturating_add(1);
+        if *count == 1 || count.is_power_of_two() {
+            if *count > 1 {
+                event.message = format!("{} (repeated {} times)", event.message, *count);
+            }
+            let _ = sender.send(event);
         }
     }
 }
@@ -670,6 +693,23 @@ mod tests {
             source: LogSource::Storage,
             message: message.to_string(),
         }
+    }
+
+    #[test]
+    fn repeated_warnings_are_suppressed_with_power_of_two_counts() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut suppressor = WarningSuppressor::default();
+        for _ in 0..8 {
+            suppressor.emit(
+                &sender,
+                LogEvent::warn(LogSource::Storage, "collector unavailable"),
+            );
+        }
+        let events = receiver.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].message, "collector unavailable");
+        assert!(events[3].message.ends_with("(repeated 8 times)"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::log::{LogEvent, LogSource};
+use crate::log::{LogEvent, LogSource, WarningSuppressor};
 use crate::topology::snapshot::NetInterface;
 use anyhow::Result;
 use std::{
@@ -35,13 +35,17 @@ pub struct NetRate {
 
 pub fn spawn_network_collector(network: Arc<Mutex<Vec<NetRate>>>, log_tx: Sender<LogEvent>) {
     thread::spawn(move || {
+        let mut warnings = WarningSuppressor::default();
         let mut previous = match read_net_dev() {
             Ok(stats) => stats,
             Err(error) => {
-                let _ = log_tx.send(LogEvent::error(
-                    LogSource::Network,
-                    format!("failed to read /proc/net/dev: {error}"),
-                ));
+                warnings.emit(
+                    &log_tx,
+                    LogEvent::error(
+                        LogSource::Network,
+                        format!("failed to read /proc/net/dev: {error}"),
+                    ),
+                );
                 return;
             }
         };
@@ -52,10 +56,13 @@ pub fn spawn_network_collector(network: Arc<Mutex<Vec<NetRate>>>, log_tx: Sender
             let current = match read_net_dev() {
                 Ok(stats) => stats,
                 Err(error) => {
-                    let _ = log_tx.send(LogEvent::warn(
-                        LogSource::Network,
-                        format!("failed to refresh /proc/net/dev: {error}"),
-                    ));
+                    warnings.emit(
+                        &log_tx,
+                        LogEvent::warn(
+                            LogSource::Network,
+                            format!("failed to refresh /proc/net/dev: {error}"),
+                        ),
+                    );
                     continue;
                 }
             };
@@ -97,7 +104,48 @@ pub fn calculate_rates(previous: &[NetStats], current: &[NetStats]) -> Vec<NetRa
         });
     }
 
+    rates.sort_by(|a, b| natural_name_cmp(&a.name, &b.name));
     rates
+}
+
+fn natural_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut ai, mut bi) = (0, 0);
+    while ai < a.len() && bi < b.len() {
+        let a_digit = a[ai].is_ascii_digit();
+        let b_digit = b[bi].is_ascii_digit();
+        let mut a_end = ai + 1;
+        let mut b_end = bi + 1;
+        while a_end < a.len() && a[a_end].is_ascii_digit() == a_digit {
+            a_end += 1;
+        }
+        while b_end < b.len() && b[b_end].is_ascii_digit() == b_digit {
+            b_end += 1;
+        }
+        let ordering = if a_digit && b_digit {
+            let a_number = &a[ai..a_end];
+            let b_number = &b[bi..b_end];
+            let a_trimmed = a_number
+                .iter()
+                .position(|byte| *byte != b'0')
+                .unwrap_or(a_number.len());
+            let b_trimmed = b_number
+                .iter()
+                .position(|byte| *byte != b'0')
+                .unwrap_or(b_number.len());
+            (a_number.len() - a_trimmed)
+                .cmp(&(b_number.len() - b_trimmed))
+                .then_with(|| a_number[a_trimmed..].cmp(&b_number[b_trimmed..]))
+        } else {
+            a[ai..a_end].cmp(&b[bi..b_end])
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+        ai = a_end;
+        bi = b_end;
+    }
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
 pub fn read_net_dev() -> Result<Vec<NetStats>> {
@@ -135,6 +183,7 @@ pub fn read_net_dev() -> Result<Vec<NetStats>> {
         interfaces.push(stats);
     }
 
+    interfaces.sort_by(|a, b| natural_name_cmp(&a.name, &b.name));
     Ok(interfaces)
 }
 
@@ -159,23 +208,58 @@ pub fn read_net_topology() -> Result<Vec<NetInterface>> {
             link.file_name()
                 .map(|value| value.to_string_lossy().into_owned())
         });
-        let members = if kind == "bond" {
-            fs::read_to_string(format!("/proc/net/bonding/{name}"))
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| line.strip_prefix("Slave Interface: "))
-                .map(str::to_string)
-                .collect()
+        let (members, members_available) = if kind == "bond" {
+            read_bond_members(&path, &name)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         interfaces.push(NetInterface {
             name,
             kind: kind.to_string(),
             master,
             members,
+            members_available,
+            operstate: read_trimmed(path.join("operstate")),
+            mtu: read_trimmed(path.join("mtu")).and_then(|value| value.parse().ok()),
         });
     }
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(interfaces)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::natural_name_cmp;
+
+    #[test]
+    fn interface_names_use_natural_numeric_order() {
+        let mut names = ["eth10", "eth2", "eno1", "eth1"];
+        names.sort_by(|a, b| natural_name_cmp(a, b));
+        assert_eq!(names, ["eno1", "eth1", "eth2", "eth10"]);
+    }
+}
+
+fn read_bond_members(path: &std::path::Path, name: &str) -> (Vec<String>, bool) {
+    let sysfs = path.join("bonding/slaves");
+    if let Ok(value) = fs::read_to_string(sysfs) {
+        return (value.split_whitespace().map(str::to_string).collect(), true);
+    }
+    match fs::read_to_string(format!("/proc/net/bonding/{name}")) {
+        Ok(value) => (
+            value
+                .lines()
+                .filter_map(|line| line.strip_prefix("Slave Interface: "))
+                .map(str::to_string)
+                .collect(),
+            true,
+        ),
+        Err(_) => (Vec::new(), false),
+    }
+}
+
+fn read_trimmed(path: impl AsRef<std::path::Path>) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }

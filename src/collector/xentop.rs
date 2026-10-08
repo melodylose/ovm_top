@@ -1,6 +1,9 @@
 use crate::collector::xm::XmDomain;
-use crate::log::{LogEvent, LogSource};
-use crate::topology::snapshot::{IdentitySource, SnapshotMeta, SnapshotStatus};
+use crate::log::{LogEvent, LogSource, WarningSuppressor};
+use crate::topology::{
+    snapshot::{IdentitySource, SnapshotStatus},
+    status::LayerStatus,
+};
 use anyhow::{Context, Result};
 use std::{
     io::{BufRead, BufReader},
@@ -49,7 +52,20 @@ pub struct DomainView {
     pub identity_source: IdentitySource,
 }
 
-pub type DomainSnapshotMeta = SnapshotMeta;
+#[derive(Debug, Clone, Default)]
+pub struct DomainLayerStatuses {
+    pub inventory: LayerStatus,
+    pub realtime: LayerStatus,
+    pub merge: LayerStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DomainSnapshotMeta {
+    pub collected_at: Option<std::time::Instant>,
+    pub generation: u64,
+    pub status: SnapshotStatus,
+    pub layers: DomainLayerStatuses,
+}
 
 pub fn spawn_domain_view_collector(
     realtime: Arc<Mutex<Vec<DomainStats>>>,
@@ -59,26 +75,58 @@ pub fn spawn_domain_view_collector(
 ) {
     thread::spawn(move || {
         let mut last_merge_diagnostic = None;
+        let mut warnings = WarningSuppressor::default();
         loop {
             let inventory = match crate::collector::xm::get_domains() {
-                Ok(v) => v,
-                Err(_) => {
-                    let _ = log_tx.send(LogEvent::warn(
-                        LogSource::Domain,
-                        "failed to refresh domain inventory with xm list",
-                    ));
+                Ok(v) => {
+                    if let Ok(mut snapshot_meta) = meta.lock() {
+                        snapshot_meta.layers.inventory = if v.is_empty() {
+                            LayerStatus::empty("xm inventory returned no domains")
+                        } else {
+                            LayerStatus::live()
+                        };
+                    }
+                    v
+                }
+                Err(error) => {
+                    if let Ok(mut snapshot_meta) = meta.lock() {
+                        snapshot_meta.layers.inventory = LayerStatus::error(error.to_string());
+                        snapshot_meta.status = SnapshotStatus::Stale;
+                    }
+                    warnings.emit(
+                        &log_tx,
+                        LogEvent::warn(
+                            LogSource::Domain,
+                            "failed to refresh domain inventory with xm list",
+                        ),
+                    );
                     thread::sleep(Duration::from_secs(2));
                     continue;
                 }
             };
 
             let realtime_snapshot = match realtime.lock() {
-                Ok(v) => v.clone(),
+                Ok(v) => {
+                    let realtime_snapshot = v.clone();
+                    if let Ok(mut snapshot_meta) = meta.lock() {
+                        snapshot_meta.layers.realtime = if realtime_snapshot.is_empty() {
+                            LayerStatus::unavailable("xentop has not published realtime rows")
+                        } else {
+                            LayerStatus::live()
+                        };
+                    }
+                    realtime_snapshot
+                }
                 Err(_) => {
-                    let _ = log_tx.send(LogEvent::warn(
-                        LogSource::Domain,
-                        "failed to read xentop domain snapshot",
-                    ));
+                    if let Ok(mut snapshot_meta) = meta.lock() {
+                        snapshot_meta.layers.realtime =
+                            LayerStatus::error("failed to lock xentop snapshot");
+                        snapshot_meta.status = SnapshotStatus::Stale;
+                    }
+                    warnings.emit(
+                        &log_tx,
+                        LogEvent::warn(LogSource::Domain, "failed to read xentop domain snapshot"),
+                    );
                     thread::sleep(Duration::from_secs(2));
                     continue;
                 }
@@ -94,6 +142,16 @@ pub fn spawn_domain_view_collector(
                     SnapshotStatus::MergeFallback
                 } else {
                     SnapshotStatus::Live
+                };
+                snapshot_meta.layers.merge = if fallback_matches > 0
+                    || unmatched_realtime > 0
+                    || unmatched_inventory > 0
+                {
+                    LayerStatus::fallback(format!(
+                        "{fallback_matches} fallback, {unmatched_inventory} inventory and {unmatched_realtime} realtime unmatched"
+                    ))
+                } else {
+                    LayerStatus::live()
                 };
             }
             let diagnostic = (fallback_matches, unmatched_realtime, unmatched_inventory);
@@ -341,6 +399,7 @@ fn publish_snapshot(
         snapshot_meta.collected_at = Some(std::time::Instant::now());
         snapshot_meta.generation = snapshot_meta.generation.saturating_add(1);
         snapshot_meta.status = SnapshotStatus::Live;
+        snapshot_meta.layers.realtime = LayerStatus::live();
     }
 }
 

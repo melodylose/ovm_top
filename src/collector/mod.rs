@@ -1,3 +1,4 @@
+pub mod block;
 pub mod disk;
 pub mod fc;
 pub mod net;

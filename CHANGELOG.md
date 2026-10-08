@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### H3 Layered Status Semantics
+
+- 將 Freshness（Live／Stale／Fallback／NoData）與 Availability（Available／Empty／Unavailable／Partial／Error／CollectorIncompatible）拆開，inventory、realtime、VIF、VBD、network、block、FC transport、multipath 與 storage mapping 各自保留狀態及原因。
+- Domain inventory、xentop realtime 與 merge fallback 使用獨立 layer status；單一 collector failure 不再覆蓋其他 layer。
+- 新鮮 VBD 資料但 mapping 不完整時維持 Live/Partial，不誤標成 Stale。
+
+### H4 FC Redundancy Semantics
+
+- Multipath map 新增 Single／Redundant／Reduced／None／Unknown redundancy，與 Healthy／Degraded／Failed／Unknown operational health 分離。
+- Redundancy 僅由 map active/total paths 判定，不由 Online HBA 數量推導。
+- AP7 fixture 驗證 13 Single、4 Redundant；AP8 fixture 驗證 17 Redundant；local PERC 均排除於 Compellent summary。
+
+### H5 Diagnostics Quality
+
+- Collector diagnostics 新增 layer、stage、kind、reason，區分 command missing、permission denied、unsupported fields、parse failure、expected empty、partial 與 unavailable。
+- Domain-0-only 的 guest VBD/VIF 為 EmptyExpected／Not applicable，不重複送出 warning。
+- VBD unresolved mapping 與 network anomaly 保留具體 stage/reason；重複 WARN/ERROR 以 power-of-two count 聚合，避免持續刷 log。
+
+### UI-R3 Reusable Topology
+
+- 新增 reusable TopologyNode／TopologyEdge／TopologyUiState，以及 NodeKind、RelationKind、Evidence；節點保留 health、redundancy、freshness、availability、confidence 與 reason。
+- Network、Storage、FC path topology 改由 model/view-model 建圖並共用 renderer；UI 不再直接 cross-join raw VIF/interface、VBD/WWID/multipath 或 FC path/HBA/target。
+- 缺少 mapping 或 FC transport evidence 時顯示 Partial／Unavailable 與原因，不建立推測 edge。
+
+### H2 Network Chain Validation
+
+- 新增 host-side network topology view model，建立 `DomID → primary VIF → bridge → bond／physical NIC` chain；UI renderer 不再自行 cross-join VIF 與 host interfaces。
+- `vif<domid>.<index>-emu` 以 auxiliary interface 保留並關聯 primary VIF，不重複計入 guest VIF summary。
+- Host interface inventory 新增 operstate、MTU 與 bond member availability，僅在 evidence 充分時診斷 missing bridge/uplink/slave、down NIC、orphan/duplicate emulated VIF、unknown parent 與 MTU／operstate mismatch。
+- Network topology 明確區分 `Complete`、`Empty`、`Unavailable`、`Partial`、`Error`；AP7 Domain-0-only 為 expected Empty，不視為 collector failure。
+- 新增 AP7／AP8 deterministic fixtures；AP8 fixture 驗證 8 primary VIF、2 auxiliary `-emu` interfaces 與兩條已收集 uplink chain 類型。
+
+### UI-R2 Shared Layout and Widgets
+
+- 集中 Root、MasterDetail、FullScreen、Popup layout primitives，Workspace 不再自行配置 root header/footer geometry。
+- 共用 visible range、snapshot/network status、health、empty 與 error presentation，保留既有 responsive、selection、scroll、detail 與快捷鍵行為。
+
+### H1 VBD Mapping Completeness
+
+- VBD model 保留 frontend、backend、device、virtual-device、physical-device、major:minor、host block、dm name、dm UUID、WWID 與 mapping confidence。
+- Xenstore reader 改由 backend path 讀取 `physical-device`／`params`，並以 `xm block-list` 補充缺少的 backend path evidence。
+- 支援 Xen 十六進位 major:minor 轉換、`/sys/dev/block` identity、block holder 到 multipath dm UUID／WWID 的 host-side 關聯，不以 frontend、`dm-X` 或 `sdX` 名稱猜測 stable identity。
+- 新增舊版 `lsblk -P` capability path，失敗或空輸出時改由 `/sys/class/block` 收集 host block、dm identity 與 holders。
+- 每筆未完成 VBD mapping 會保留 unresolved stage 與具體 reason，不再只有 `Unknown`。
+
+### UI-R1 Module Split
+
+- 將單體 `src/ui.rs` 拆為 root router、共用 layout/widgets，以及 Overview、Domains、Network、Disk、Logs、FC/SAN workspace renderer。
+- 保留原有 Workspace、DetailTarget、InputMode、responsive master/detail、visible range、context footer/help 與快捷鍵行為；本階段未新增 topology cross-join 或 UI framework dependency。
+
 ### Workspace UI / UX Steps 2–8
 
 - 新增 `Workspace`、`InputMode` 與帶 identity 的互斥 `DetailTarget`，並保留 `h/l/u/d/o/4/q` 舊快捷鍵。
