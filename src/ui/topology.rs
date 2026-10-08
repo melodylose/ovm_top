@@ -187,6 +187,7 @@ fn hierarchy_rows(
 
     let mut rows = Vec::new();
     let mut displayed = HashSet::new();
+    let mut shared_references = HashSet::new();
     for node in roots {
         append_node_rows(
             state,
@@ -195,6 +196,7 @@ fn hierarchy_rows(
             None,
             &children,
             &mut displayed,
+            &mut shared_references,
             detailed,
             &mut rows,
         );
@@ -209,10 +211,14 @@ fn append_node_rows(
     incoming: Option<&crate::topology::view::TopologyEdge>,
     children: &HashMap<&str, Vec<&crate::topology::view::TopologyEdge>>,
     displayed: &mut HashSet<String>,
+    shared_references: &mut HashSet<String>,
     detailed: bool,
     rows: &mut Vec<Row<'static>>,
 ) {
     let shared = !displayed.insert(node.id.clone());
+    if shared && !shared_references.insert(node.id.clone()) {
+        return;
+    }
     let label = if shared {
         format!("{prefix}↳ shared {}", node_label(node))
     } else {
@@ -271,6 +277,7 @@ fn append_node_rows(
                 Some(edge),
                 children,
                 displayed,
+                shared_references,
                 detailed,
                 rows,
             );
@@ -510,6 +517,31 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("↳ shared"));
         assert_eq!(rendered.matches("bond0").count(), 1);
+    }
+
+    #[test]
+    fn shared_node_has_one_reference_even_with_multiple_parents() {
+        let state = TopologyUiState {
+            nodes: vec![
+                test_node("domain-a", "DomID A", NodeKind::Domain),
+                test_node("domain-b", "DomID B", NodeKind::Domain),
+                test_node("domain-c", "DomID C", NodeKind::Domain),
+                test_node("bridge", "br0", NodeKind::Bridge),
+            ],
+            edges: vec![
+                test_edge("domain-a", "bridge", RelationKind::Owns),
+                test_edge("domain-b", "bridge", RelationKind::Owns),
+                test_edge("domain-c", "bridge", RelationKind::Owns),
+            ],
+            ..Default::default()
+        };
+        let rendered = hierarchy_rows(&state, &|_| true, false)
+            .iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered.matches("br0").count(), 2);
+        assert_eq!(rendered.matches("↳ shared").count(), 1);
     }
 
     #[test]

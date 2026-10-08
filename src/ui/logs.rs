@@ -46,7 +46,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(format!(
             "Time: {time}   Level: {level}   Source: {source}   Text: {search}"
         ))
-        .block(block("Memory-only Filters")),
+        .block(block("Log Filters")),
         chunks[0],
     );
     let entries: Vec<_> = app
